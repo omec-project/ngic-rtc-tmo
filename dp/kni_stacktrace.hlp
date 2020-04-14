@@ -1,0 +1,176 @@
+Tue Jun 25 13:15:55 PDT 2019
+/* ASR- KNI pipeline trace */
+
+@dpdk/lib/librte_kni/rte_kni.c::
+	/**
+	 * KNI context
+	 */
+	struct rte_kni {
+		char name[RTE_KNI_NAMESIZE];        /**< KNI interface name */
+		uint16_t group_id;                  /**< Group ID of KNI devices */
+		uint32_t slot_id;                   /**< KNI pool slot ID */
+		struct rte_mempool *pktmbuf_pool;   /**< pkt mbuf mempool */
+		unsigned mbuf_size;                 /**< mbuf size */
+
+		struct rte_kni_fifo *tx_q;          /**< TX queue */
+		struct rte_kni_fifo *rx_q;          /**< RX queue */
+		struct rte_kni_fifo *alloc_q;       /**< Allocated mbufs queue */
+		struct rte_kni_fifo *free_q;        /**< To be freed mbufs queue */
+
+		/* For request & response */
+		struct rte_kni_fifo *req_q;         /**< Request queue */
+		struct rte_kni_fifo *resp_q;        /**< Response queue */
+		void * sync_addr;                   /**< Req/Resp Mem address */
+
+		struct rte_kni_ops ops;             /**< operations for request */
+		uint8_t in_use : 1;                 /**< kni in use */
+	};
+
+
+/* *********************************************
+ * KNI Inress flow
+ ******************************************** */
+@dp/pipeline/epc_ul.c::
+static int epc_ul_port_in_ah(struct rte_pipeline *p,
+		struct rte_mbuf **pkts, uint32_t n,	void *arg) {
+	...
+	kni_ingress(kni_port_params_array[S1U_PORT_ID],
+				kni_pkts_burst, ul_nkni_pkts);
+	...
+}
+
+	@dp/kni_pkt_handler.c::
+	/**
+	 * Burst rx from dpdk interface and transmit burst to kni interface.
+	 * Pkts transmitted to KNI interface, onwards linux will handle whatever pkts rx
+	 * on kni interface
+	 */
+	kni_ingress(struct kni_port_params *p,
+			struct rte_mbuf *pkts_burst[PKT_BURST_SZ], unsigned nb_rx) {
+		...
+			/* Burst tx to kni */
+			unsigned int num = rte_kni_tx_burst(p->kni[i], pkts_burst, nb_rx);
+			if (unlikely(num < nb_rx)) {
+				/* Free mbufs not tx to kni interface */
+				kni_burst_free_mbufs(&pkts_burst[num], nb_rx - num);
+			}
+		...
+	}
+
+		@dpdk/lib/librte_kni/rte_kni.c::
+		rte_kni_tx_burst(struct rte_kni *kni, struct rte_mbuf **mbufs, unsigned num) {
+			void *phy_mbufs[num];
+			...
+			for (i = 0; i < num; i++)
+				phy_mbufs[i] = va2pa(mbufs[i]);
+
+			ret = kni_fifo_put(kni->rx_q, phy_mbufs, num);
+
+			/* Get mbufs from free_q and then free them */
+			kni_free_mbufs(kni);
+			...
+		}
+
+		kni_free_mbufs(struct rte_kni *kni) {
+		{
+			...
+			struct rte_mbuf *pkts[MAX_MBUF_BURST_NUM];
+
+			ret = kni_fifo_get(kni->free_q, (void **)pkts, MAX_MBUF_BURST_NUM);
+			if (likely(ret > 0)) {
+				for (i = 0; i < ret; i++)
+					rte_pktmbuf_free(pkts[i]);
+			}
+			...
+		}
+
+/* *********************************************
+ * KNI Egress flow
+ ******************************************** */
+@dp/pipeline/epc_arp.c::
+/* Burst rx from kni interface and enqueue rx pkts in ring */
+static void *handle_kni_process(__rte_unused void *arg) {
+	for (uint32_t port = 0; port < nb_ports; port++) {
+		kni_egress(kni_port_params_array[port]);
+	}
+	return NULL; //GCC_Security flag
+}
+
+	@dp/kni_pkt_handler.c::
+	/**
+	 * Burst rx from kni interface and enqueue rx pkts in ring.
+	 */
+	kni_egress(struct kni_port_params *p) {
+		struct rte_mbuf *pkts_burst[PKT_BURST_SZ] = {NULL};
+		...
+		for (uint32_t i = 0; i < p->nb_kni; i++) {
+			/* Burst rx from kni */
+			unsigned nb_rx = rte_kni_rx_burst(p->kni[i], pkts_burst, PKT_BURST_SZ);
+			if (unlikely(nb_rx > PKT_BURST_SZ)) {
+				RTE_LOG_DP(ERR, KNI, "Error receiving from KNI\n");
+				return;
+			}
+			...
+			for (uint32_t pkt_cnt = 0; pkt_cnt < nb_rx; ++pkt_cnt) {
+				int ret = rte_ring_enqueue(shared_ring[p->port_id], pkts_burst[pkt_cnt]);
+				if (ret == -ENOBUFS) {
+					rte_pktmbuf_free(pkts_burst[pkt_cnt]);
+					RTE_LOG_DP(ERR, DP, "%s::Can't queue pkt- ring full..."
+							" Dropping pkt", __func__);
+					continue;
+				}
+			}
+		}
+	}
+
+		@dpdk/lib/librte_kni/rte_kni.c::
+		rte_kni_rx_burst(struct rte_kni *kni, struct rte_mbuf **mbufs, unsigned num) {
+			unsigned ret = kni_fifo_get(kni->tx_q, (void **)mbufs, num);
+
+			/* If buffers removed, allocate mbufs and then put them into alloc_q */
+			if (ret)
+				kni_allocate_mbufs(kni);
+
+			return ret;
+		}
+
+		kni_allocate_mbufs(struct rte_kni *kni) {
+			...
+			struct rte_mbuf *pkts[MAX_MBUF_BURST_NUM];
+			void *phys[MAX_MBUF_BURST_NUM];
+			int allocq_free;
+			...
+
+			/* Check if pktmbuf pool has been configured */
+			if (kni->pktmbuf_pool == NULL) {
+				RTE_LOG(ERR, KNI, "No valid mempool for allocating mbufs\n");
+				return;
+			}
+
+			allocq_free = (kni->alloc_q->read - kni->alloc_q->write - 1) \
+					& (MAX_MBUF_BURST_NUM - 1);
+			for (i = 0; i < allocq_free; i++) {
+				pkts[i] = rte_pktmbuf_alloc(kni->pktmbuf_pool);
+				if (unlikely(pkts[i] == NULL)) {
+					/* Out of memory */
+					RTE_LOG(ERR, KNI, "Out of memory\n");
+					break;
+				}
+				phys[i] = va2pa(pkts[i]);
+			}
+
+			/* No pkt mbuf allocated */
+			if (i <= 0)
+				return;
+
+			ret = kni_fifo_put(kni->alloc_q, phys, i);
+
+			/* Check if any mbufs not put into alloc_q, and then free them */
+			if (ret >= 0 && ret < i && ret < MAX_MBUF_BURST_NUM) {
+				int j;
+
+				for (j = ret; j < i; j++)
+					rte_pktmbuf_free(pkts[j]);
+			}
+		}
+

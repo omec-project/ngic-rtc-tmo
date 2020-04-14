@@ -1,0 +1,143 @@
+1. Following is the flow diagram for CDR (FTP-S Build),
+				 	   +---------+
+	    			       +---|   KMS   |--+
+	   	     	               |   +---------+  |
+	    	      		       |                |
+   +-------------------+    +-------------+     +--------------+     +-----------------------------+
+   | CP/OpenSSL client |--->|SGX Dealer-In| --->|SGX Dealer-Out| --->| FTP-S Client (implicit mode)|
+   +-------------------+    +-------------+     +--------------+     +-----------------------------+
+
+2. Intel software guard extensions (SGX) should be enabled in BIOS settings
+   on the SGX servers
+3. Download the source code from below path,
+	https://ilpm.intel-research.net/bitbucket/scm/vccccb/sgx-cdr.git
+4. Setup dealers on server 1(same setup is used for dealer-in and dealer-out):
+	a. Navigate to the below path,
+		cd $(installation path)/sgx-cdr/dealer/
+	b. Run the following command (as root / sudo),
+		./install.sh
+	c. Update the required parameters in conf/dealer-in.json (ignore other params for FTP-S mode)
+		common->kmsserver -- <KMS server IP>
+		common->kmsport -- 8443
+		dealer->runmode -- IN
+		dealer->port -- 443
+	d. Update the required parameters in conf/dealer-out.json (ignore other params for FTP-S mode)
+		common->kmsserver -- <KMS server IP>
+		common->kmsport -- 8443
+		dealer->runmode -- OUT
+		dealer->port -- 445 (444 (dealer->port-1) will automatically be used for FTP-S passive port)
+	e. Currently Enclave/ca_bundle.h is configured with sample certificates, should be updated with
+	   production certificates during deployment.(for testing we can use default value)
+	f. Once received SGX production key, update the #define KMS_MRSIGNER in Enclave/ca_bundle.h
+	  (for testing we can use default value)
+	g. Build the dealer using the command,
+		make clean;make SGX_MODE=HW SGX_DEBUG=1
+	h. Make sure 'cdrpath' and 'cdrarchpath' actually exists as mentioned in  conf/dealer-in.json, if not create it first.
+	i. If the SGX dealer server needs http proxy to reach internet, then
+		- configure http_proxy and https_proxy environment variable appropriately
+		- configure /etc/aesmd.conf to be able to access internet
+			proxy type    = manual #aesm proxy should be specified for manual proxy type
+			aesm proxy    = http://10.255.92.238:3128 
+		- systemctl restart aesmd
+	j. Run this command to know about the dealer's identity (MRENCLAVE,MRSIGNER and ISV_SVN),
+		./dealer -j conf/dealer-in.json -x
+5. Setup KMS on server 2:
+	a. Navigate to the below path,
+		cd $(installation path)/sgx-cdr/kms/
+	b. Run the following command (as root / sudo),
+		./install.sh
+	c. Set the MRENCLAVE and MRSIGNER of dealer in Enclave/ca_bundle.h file.
+		Here, the structure array “const EnclaveMeasurements dealerMeasurements[]” should consist of
+		MRENCLAVE and MRSIGNER similar to the following:
+			{
+					"9525fc227fde387fxxxxxx...xxxx"
+					"63ef969cbc34ee46xxxxxx...xxxx"
+					0,
+					0
+			},
+			{
+					"",
+					"",
+					0,
+					0
+			},
+	d. Update the required parameters in conf/kms.json (already ports updated, so just ignore this step unless port changed)
+	e. Build the KMS using the command,
+		make clean;make SGX_MODE=HW SGX_DEBUG=1
+	f. If the SGX KMS server needs http proxy to reach internet, then
+                - configure http_proxy and https_proxy environment variable appropriately
+                - configure /etc/aesmd.conf to be able to access internet
+                        proxy type    = manual #aesm proxy should be specified for manual proxy type
+                        aesm proxy    = http://10.255.92.238:3128
+                - systemctl restart aesmd
+
+6. Setting up simulated CP environment for testing SGX CDR communication,
+	a. Create cert directory and place X509 Certificate PEM file issued by CA and X509 Private key PEM file (including CA cert file).
+	   For testing, sample certificates are available on $(installation path)/sgx-cdr/dealer/certs/sample-certs
+7. Setup SFTP client (for testing SGX FTP-S communication)
+	a. Install stunnel4 using the following command,
+		apt-get install stunnel4
+	b. Create directory (/root/ftptest/) and copy the required certificates (cert.pem and key.pem) from
+	   $(installation path)/sgx-cdr/dealer/certs/sample-certs. For production use certificates from step 6a.
+	   
+	   Some clients like WinSCP FTPS (implicit mode) needs a combined client certificate (ex. a sample cert_key.pem is present
+	   in $(installation path)/sgx-cdr/dealer/certs/sample-certs)
+
+	c. Create and update /etc/stunnel/stunnel.conf as follows,
+		[stunnel.ftps]
+		accept = localhost:445
+		connect = <dealer-out IP>:445
+		cert = /root/ftptest/cert.pem
+		key = /root/ftptest/key.pem
+		client = yes
+
+		[stunnel.ftps-data]
+		accept = localhost:444
+		connect = <dealer-out IP>:444
+		cert = /root/ftptest/cert.pem
+		key = /root/ftptest/key.pem
+		client = yes
+	d. Start stunnel using below command,
+		stunnel4 /etc/stunnel/stunnel.conf
+8. Follow the below sequence to start the executables:(for testing the SGX CDR communication)
+	a. Start the KMS
+		cd $(installation path)/sgx-cdr/kms/
+		./kms -j conf/kms.json
+	b. Start the dealer-in
+		cd $(installation path)/sgx-cdr/dealer/
+		./dealer -j conf/dealer-in.json
+	c. Start the dealer-out
+		cd $(installation path)/sgx-cdr/dealer/
+		./dealer -j conf/dealer-out.json
+	d. From CP node run below command,
+		cd certs/
+		openssl s_client -connect <dealer-in IP>:443 -cert cert.pem -key key.pem
+		--> 20190506155809.csv (press enter)
+		--> Test data can be send here (press enter)
+		ctrl + c
+	e. Download the CDR files using below command from FTP-S client,
+		ftp 127.0.0.1 445
+		ftp> Type anonymous as username and password (authentication will be done based on certificates)
+		ftp> pa (passive mode on)
+		ftp> bi (binary mode)
+		ftp> ls (file listing)
+		ftp> get <CDR filename>
+		ftp> quit
+		Verify the content which is transferred from CP node.
+---------------------------------------------------------------------------------------------------------------------------------------------
+
+Intel(R) SGX Attestation requirements 
+	1. Both KMS and SGX Dealers generate Self signed SSL X.509 certificates for establishing TLS connection between each other, CP and FTPS Client
+	2. However, the actual veirification of SGX components are done using EPID based SGX attestation over TLS a.k.s RA-TLS
+	  	More details on RA-TLS can be found here : https://github.com/cloud-security-research/sgx-ra-tls/blob/master/whitepaper.pdf  
+	2. The actual Verification is done based on SGX quote that is signed by Intel(R) Attestation service (IAS) hosted at : 
+		https://test-as.sgx.trustedservices.intel.com:443/attestation/sgx/v3/report
+        3. Since the service is hosted on the internet, the KMS and Dealer servers need to reach out to IAS for getting thier SGX quotes signed.
+	4. After the quote is successfully signed, it is embedded inside the self signed certificates as a certicate extension.
+	5. This challenger would then verify the signed quote with Intel'IAS root CA Cert. 
+	6. However, a new SGX capability called DCAP will also be supported in next version that will not have any dependency for connecting to internet. 
+			More details at https://download.01.org/intel-sgx/dcap-1.1/linux/docs/Intel_SGX_DCAP_ECDSA_Orientation.pdf
+
+------------------------------------------------------------------------------------------------------------------------------------------------
+
+

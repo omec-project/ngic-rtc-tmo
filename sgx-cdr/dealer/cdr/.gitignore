@@ -1,0 +1,4 @@
+# This directory is for storing CDR files during runtime of the dealer. Ignore everything in this directory
+*
+# Except this file
+!.gitignore

@@ -1,0 +1,317 @@
+@~/cp/cp.h::
+struct cp_params {
+	unsigned stats_core_id;
+	unsigned nb_core_id;
+	...
+	unsigned simu_core_id;
+};
+
+@~/cp/main.c::
+	master_lcore():: {
+		...
+		rte_eal_remote_launch(simu_cp, NULL, cp_params.simu_core_id);
+		rte_eal_remote_launch(listener, NULL, cp_params.nb_core_id);
+		rte_eal_remote_launch(do_stats, NULL, cp_params.stats_core_id);
+		...
+		while (1) {
+			control_plane();
+			...
+
+			@~/cp/gtpv2c_messages/create_session.c::
+			process_create_session_request(...) {
+				...
+				if (session_create(dp_id, session) < 0)
+					rte_exit(EXIT_FAILURE,"Bearer Session create fail !!!");
+				...
+
+				@~/cp_dp_api/vepc_cp_dp_api.c::
+				session_create(struct dp_id dp_id, struct session_info entry) {
+					...
+					struct msgbuf msg_payload;
+					build_dp_msg(MSG_SESS_CRE, dp_id, (void *)&entry, &msg_payload);
+					...
+					return send_dp_msg(dp_id, &msg_payload);
+				}
+					...
+					send_dp_msg(struct dp_id dp_id, struct msgbuf *msg_payload) {
+						if (active_comm_msg->send((void *)msg_payload, sizeof(struct msgbuf)) < 0)...
+							...
+					}
+				...
+			}
+
+			/* SM- IMSI/FTEID Hash table in-consistency issue:
+			 * Remove entry from imsi/fteid hash without relying on Delete
+			 * Session response from DP. In this way, even if DP not responding
+			 * for the Delete Session Request, CP HASH table will be cleaned
+			 * and consistency maintained */
+
+			@~/cp/gtpv2c_messages/delete_session.c::
+			process_delete_session_request(...) {
+				...
+				delete_dp_context() {
+					...
+					rte_hash_del_key(ue_context_by_imsi_hash,
+						(const void *) &context->imsi);
+					rte_hash_del_key(ue_context_by_fteid_hash,
+						(const void *) &context->s11_sgw_gtpc_teid);
+					session_delete(dp_id, &si);
+				}
+			}
+		}
+	}
+
+cp_params.simu_core_id::
+	@/test/simu_cp/simu_cp.c::
+	int simu_cp(__rte_unused void *ptr) {
+		/* Form and send CS and MB request to DP. */
+		ret = process_cs_mb_req(&cfg);
+		print_stats(&cfg);
+
+		/* Form and send delete request to DP. */
+		ret = process_delete_req(&cfg);
+		print_del_stats(&cfg);
+	}
+
+cp_params.nb_core_id::
+	@/cp/main.c::
+	listener(__rte_unused void *arg) {
+		iface_init_ipc_node();
+		...
+		while (1) {
+			iface_remove_que(COMM_ZMQ);
+		}
+
+		@~/interface/ipc/dp_ipc_api.c::
+		int iface_remove_que(enum cp_dp_comm id) {
+			...
+			rc = comm_node[id].recv((void *)&r_buf, sizeof(struct resp_msgbuf));
+			...
+			process_resp_msg((void *)&r_buf);
+		}
+	}
+
+cp_params.stats_core_id::
+	@~/cp_stats.c::
+	do_stats(__rte_unused void *ptr) {
+		while (1) {
+			...
+			print_stat_entries();
+			sleep(1);
+		}
+	}
+
+/* ASR- Suggested File/Directory name changes */
+dp_ipc_api.c
+common_ipc_api.*
+
+/home/ngic-rtc-tmopl/cp_dp_api
+/home/ngic-rtc-tmopl/cpdp_api
+vepc_cp_dp_api.*
+common_cpdp_api.*
+
+Wed Jun  5 14:39:12 PDT 2019 >>
+Thu Jan 30 09:32:16 PST 2020
+/* ASR- S11-CP-DP Interactions. Note: Relevant code snippets only */
+Thu Feb 27 11:16:58 PST 2020
+/* SM- IMSI/FTEID Hash table in-consistency issue: Updates:: */
+
+/* CP >> DP */
+cp::
+	session_create(struct dp_id dp_id, struct session_info entry) {
+		entry->op_id = op_id;
+		add_resp_op_id_hash();
+		...
+		struct msgbuf msg_payload;
+		build_dp_msg(MSG_SESS_CRE, dp_id, (void *)entry, &msg_payload);
+		return send_dp_msg(dp_id, &msg_payload);
+	}
+		add_resp_op_id_hash(void) {
+			...
+			switch (resp_t.msg_type) {
+				case GTP_CREATE_SESSION_REQ:
+				case GTP_MODIFY_BEARER_REQ:
+				case GTP_DELETE_SESSION_REQ: {
+					struct response_info *tmp = rte_zmalloc("test",
+							sizeof(struct response_info),
+							RTE_CACHE_LINE_SIZE);
+					memcpy(tmp, &resp_t, sizeof(struct response_info));
+
+					/* SM- IMSI/FTEID Hash table in-consistency issue:
+					 * Check if any existing entries available in
+					 * resp_op_id_hash (stale entries) and remove
+					 * the entry if it exists and clear the resources.
+					 *
+					 * NOTE: The key size for resp_op_id_hash is uint16_t,
+					 * so the maximum key value is 65535, once it reaches
+					 * this value then it will restart from 0 again. Please
+					 * note that there is no correlation b/w this resp_op_id_hash
+					 * maximum key value(65535) and number of UE session supported
+					 * by CP.
+					 */
+
+					ret = rte_hash_lookup_data(resp_op_id_hash,
+								(void *)&op_id,	(void **)&tmp_resp);
+					if (ret) {
+						/* SM- CDR Record generation for resp_op_id_hash
+						 * stale entry case: Generate CDR Record, encode
+						 * in ASN format and send the record.
+						 */
+						sctf_msg_assemble(rbuf);
+						der_length = sctf_to_asn1_encode(sctf_msg, der);
+/* CP >> SGX-CDR */
+						if((der_length != 0) && send_cdr)
+							write_sctf(der, der_length);
+
+						/* Remove the entry from resp_op_id_hash before
+						 * inserting the new entry.
+						 */
+						ret = rte_hash_del_key(resp_op_id_hash, (void *)&op_id);
+
+						/* Clear the context reference */
+						delete_cp_context(&(tmp_resp->cp_context_hash),
+							tmp_resp->cp_context_ref, tmp_resp->cp_pdn_ref,
+							tmp_resp->ebi);
+
+					}
+
+					ret = rte_hash_add_key_data(resp_op_id_hash, (void *)&op_id,
+							(void *)tmp);
+					break;
+				}
+			}
+		}
+
+dp::CP-DP IFACE Core::
+	iface_remove_que(enum cp_dp_comm id)
+	{
+		...
+			rc = comm_node[id].recv((void *)&rbuf, sizeof(struct msgbuf));
+		...
+	}
+	process_comm_msg(void *buf) {
+		struct msgbuf *rbuf = (struct msgbuf *)buf;
+		...
+		/* Callback APIs */
+		struct ipc_node *cb;
+		cb = &basenode[rbuf->mtype];
+
+		struct resp_msgbuf resp = {0};
+		...
+		/* ASR- Callback msg handler registered
+		 ...
+		 * msg_cb(MSG_SESS_DEL, cb_session_delete); */
+		int rc = cb->msg_cb(rbuf);
+		if (rc == 0) {
+			switch(rbuf->mtype) {
+				case MSG_SESS_CRE: {
+					/* ASR- Preserve::
+					 * cp::session_info->op_id >> dp::resp_msgbuf.op_id */
+					resp.op_id = rbuf->msg_union.sess_entry.op_id;
+					resp.dp_id.id = DPN_ID;
+					resp.mtype = DPN_CREATE_RESP;
+					resp.sess_id = rbuf->msg_union.sess_entry.sess_id;
+/* CP << DP */
+					zmq_mbuf_push((void *)&resp, sizeof(resp));
+					break;
+				}
+			...
+			}
+		}
+	}
+
+cp::CP NB Core::
+	iface_remove_que(enum cp_dp_comm id)
+	{
+		...
+		rc = comm_node[id].recv((void *)&r_buf, sizeof(struct resp_msgbuf));
+		process_dp_resp((void *)&r_buf);
+		...
+	}
+	process_dp_resp(void *buf) {
+		struct resp_msgbuf *rbuf = (struct resp_msgbuf *)buf;
+		switch(rbuf->mtype) {
+			case DPN_CREATE_RESP:
+			case DPN_MODIFY_RESP:
+				del_resp_op_id(rbuf->op_id);
+				break;
+
+			case DPN_DELETE_RESP:
+				/* SM- CDR Record generation for Delete Sess Resp from DP:
+				 * Generate CDR Record, encode in ASN format and send the Record
+				 */
+				/* Populate CDR message structure */
+				sctf_msg_assemble(rbuf);
+				/* Encode the CDR message in ASN Format */
+				der_length = sctf_to_asn1_encode(sctf_msg, der);
+/* CP >> SGX-CDR */
+				/* Send the CDR message to SGX CDR Dealer */
+				if((der_length != 0) && send_cdr)
+					write_sctf(der, der_length);
+
+				del_resp_op_id(rbuf->op_id);
+			case CDR_UPDATE:
+				/* SM- CDR Record generation for CDR UPDATE
+				 * (On Timer expiry, Data volume Threshold reached) from DP:
+				 * Generate CDR Record, encode in ASN format and send the Record
+				 */
+				/* Populate CDR message structure */
+				sctf_msg_assemble(rbuf);
+				/* Encode the CDR message in ASN Format */
+				der_length = sctf_to_asn1_encode(sctf_msg, der);
+/* CP >> SGX-CDR */
+				/* Send the CDR message to SGX CDR Dealer */
+				if((der_length != 0) && send_cdr)
+					write_sctf(der, der_length);
+		}
+	}
+	del_resp_op_id(uint64_t resp_op_id) {
+		struct response_info *tmp = NULL;
+		ret = rte_hash_lookup_data(resp_op_id_hash, (void *)&resp_op_id,
+				(void **)&tmp);
+		switch (tmp->msg_type) {
+			case GTP_CREATE_SESSION_REQ: {
+				switch(spgw_cfg){
+					case SGWC:
+					case SPGWC: {
+						/* TMOPL VCCCCB-19: cause argument for s11 response */
+						set_create_session_response(&(tmp->gtpv2c_tx_t),
+								tmp->gtpv2c_tx_t.teid_u.has_teid.seq,
+								&(tmp->context_t), &(tmp->pdn_t),
+								&(tmp->bearer_t), GTPV2C_CAUSE_REQUEST_ACCEPTED);
+
+						payload_length = ntohs(tmp->gtpv2c_tx_t.gtpc.length)
+							+ sizeof(tmp->gtpv2c_tx_t.gtpc);
+
+/* S11 << CP */
+						gtpv2c_send(s11_fd, (uint8_t*)&(tmp->gtpv2c_tx_t),
+								payload_length,
+								(struct sockaddr *) &s11_mme_sockaddr,
+								s11_mme_sockaddr_len);
+						break;
+						}
+					}
+			}
+			case GTP_DELETE_SESSION_REQ: {
+			switch(spgw_cfg){
+				case SGWC:
+				case SPGWC:
+					...
+					/* SM- IMSI/FTEID Hash table in-consistency issue:
+					 * After receiving the Delete Session Response from DP,
+					 * free the context resources. Please note that the entries
+					 * from IMSI/FTEID hash already removed before sending Request
+					 * to DP. So we only need to clear the context which is stored
+					 * to use for CDR processing.
+					 */
+					delete_cp_context(&(tmp->cp_context_hash), tmp->cp_context_ref,
+								tmp->cp_pdn_ref, tmp->ebi);
+					...
+			}
+		}
+	}
+
+
+
+
+

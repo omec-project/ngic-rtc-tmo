@@ -1,0 +1,1187 @@
+diff --git a/include/utils.h b/include/utils.h
+index 51f78a2..b64ab24 100644
+--- a/include/utils.h
++++ b/include/utils.h
+@@ -1,21 +1,9 @@
+ #ifndef __FTP_MYSOCKET_H__
+ #define __FTP_MYSOCKET_H__
++#include "mbedtls/ssl.h"
++#include "mbedtls/net.h"
+ 
+-#include <stdio.h>
+-#include "sys/socket.h"
+-
+-struct sockaddr new_addr(uint32_t inaddr, unsigned short port);
+-int new_server(uint32_t inaddr, uint16_t port, int backlog);
+-int new_client(uint32_t srv_addr, unsigned short port);
+-int send_str(int peer, const char *fmt, ...);
+-int send_file(int peer, FILE *f);
+-int send_path(int peer, char *file, uint32_t offset);
+-int recv_file(int peer, FILE *f);
+-int recv_path(int peer, char *file, uint32_t offset);
+-
+-int parse_number(const char *buf, uint32_t *number);
+-int parse_addr_port(const char *buf, uint32_t *addr, uint16_t *port);
+-char * parse_path(const char *buf);
+-char * n2a(uint32_t addr);
++int send_str(mbedtls_ssl_context *ssl, const char *fmt, ...);
++char * parse_path(const char *buf, char *path);
+ #endif
+ 
+diff --git a/include/vars.h b/include/vars.h
+index d17e0e5..e5d18a1 100644
+--- a/include/vars.h
++++ b/include/vars.h
+@@ -1,15 +1,8 @@
+ #ifndef __FTP_VARS_H__
+ #define __FTP_VARS_H__
+ 
+-#include <sys/socket.h>
+-#include <netinet/in.h>
+-
+ #define BUF_SIZE 1024
+ 
+-#define LISTEN_ADDR INADDR_ANY
+-#define LISTEN_PORT 2121
+-#define MAX_CONNECTIONS 5
+-
+ enum FTP_CMD {
+     INVALID = -1,
+     USER,
+@@ -35,12 +28,15 @@ enum FTP_CMD {
+     HELP,
+     NOOP,
+     TYPE,
++    FEAT,
+     PASV,
+     PORT,
+     SYST,
+     QUIT,
+     MDTM,
+     SIZE,
++    PBSZ,
++    PROT,
+     FTP_CMD_COUNT,
+ };
+ 
+@@ -81,7 +77,7 @@ extern struct ftp_cmd FTP_CMD_LIST[FTP_CMD_COUNT];
+ 
+ #define W(s,d) "%d "s" \r\n",d
+ #define FTP_OK W("OK",RPL_OK)
+-#define FTP_RDY W("Welcome to zTrix FTP", RPL_RDY)
++#define FTP_RDY W("Welcome to SGX FTP Server", RPL_RDY)
+ #define FTP_QUIT W("Welcome back", RPL_QUIT)
+ #define FTP_HELP W("Help msg", RPL_OK)
+ #define FTP_NAMEOK W("User name okay need password", RPL_NAMEOK)
+@@ -111,6 +107,7 @@ extern struct ftp_cmd FTP_CMD_LIST[FTP_CMD_COUNT];
+ #define FTP_RNFR W("RNFR success, waiting RNT", RPL_RNFR)
+ #define FTP_RNTO W("RNTO success", RPL_RNTO)
+ #define FTP_CMDNOIM W("command not implemented", RPL_CMDNOIM)
++#define FTP_PBSZ W("Accepted", RPL_OK)
+ 
+ enum DATA_TYPE {
+     TYPE_ASCII,
+diff --git a/lib/utils.c b/lib/utils.c
+index c9e1bf4..141e1b4 100644
+--- a/lib/utils.c
++++ b/lib/utils.c
+@@ -1,5 +1,3 @@
+-#include <sys/socket.h>
+-#include <arpa/inet.h>
+ #include <stdarg.h>
+ #include <errno.h>
+ #include <string.h>
+@@ -8,175 +6,17 @@
+ #include "vars.h"
+ #include "utils.h"
+ 
+-struct sockaddr new_addr(uint32_t inaddr, unsigned short port) {
+-    struct sockaddr_in addr;
+-    memset(&addr, 0, sizeof(addr));
+-    addr.sin_family = AF_INET;
+-    addr.sin_addr.s_addr = htonl(inaddr);
+-    addr.sin_port = htons(port);
+-    return *(struct sockaddr *)&addr;
+-}
+-
+-int new_server(uint32_t inaddr, uint16_t port, int backlog) {
+-    int ret = 0;
+-    int server;
+-    server = socket(AF_INET, SOCK_STREAM, 0);
+-    struct sockaddr addr = new_addr(inaddr, port);
+-    if (bind(server, &addr, sizeof(addr)) < 0) {
+-        return -2;
+-    }
+-    if (listen(server, backlog) < 0) {
+-        return -3;
+-    }
+-    return server;
+-}
+-
+-/**
+- * new client 
+- * @return {int} status, -2 create socket error, -1 connect error
+- */
+-int new_client(uint32_t srv_addr, unsigned short port) {
+-    int client = socket(AF_INET, SOCK_STREAM, 0);
+-    if (client < 0) return -2;
+-    struct sockaddr server = new_addr(srv_addr, port);
+-    int st = connect(client, &server, sizeof(server));
+-    if (st < 0) return -1;
+-    return client;
+-}
+-
+-int send_str(int peer, const char* fmt, ...) {
++int send_str(mbedtls_ssl_context* ssl, const char* fmt, ...) {
+     va_list args;
+     char msgbuf[BUF_SIZE];
+     va_start(args, fmt);
+     vsnprintf(msgbuf, sizeof(msgbuf), fmt, args);
+     va_end(args);
+-    return send(peer, msgbuf, strlen(msgbuf), 0);
+-}
+-
+-/**
+- * -1 error, 0 ok
+- */
+-int send_file(int peer, FILE *f) {
+-    char filebuf[BUF_SIZE+1];
+-    int n, ret = 0;
+-    while ((n=fread(filebuf, 1, BUF_SIZE, f)) > 0) {
+-        int st = send(peer, filebuf, n, 0);
+-        if (st < 0) {
+-            err(1, "send file error, errno = %d, %s", errno, strerror(errno));
+-            ret = -1;
+-            break;
+-        } else {
+-            filebuf[n] = 0;
+-            info(1, " %d bytes sent", st);
+-        }
+-    }
+-    return ret;
+-}
+-
+-/**
+- *  -1 error opening file, -2 send file error, -3 close file error
+- */
+-int send_path(int peer, char *file, uint32_t offset) {
+-    FILE *f = fopen(file, "rb");
+-    if (f) {
+-        fseek(f, offset, SEEK_SET);
+-        int st = send_file(peer, f);
+-        if (st < 0) {
+-            return -2;
+-        }
+-    } else {
+-        return -1;
+-    }
+-    int ret = fclose(f);
+-    return ret == 0 ? 0 : -3;
++    return mbedtls_ssl_write(ssl, (unsigned char *)msgbuf, strlen(msgbuf));
++    //return send(peer, msgbuf, strlen(msgbuf), 0);
+ }
+ 
+-int recv_file(int peer, FILE *f) {
+-    char filebuf[BUF_SIZE];
+-    int n;
+-    while ((n=recv(peer, filebuf, BUF_SIZE, 0)) > 0) {
+-        fwrite(filebuf, 1, n, f);
+-    }
+-    return n;
+-}
+-
+-/**
+- * recv file by file path
+- * @param {int} peer, peer socket
+- * @param {char *} file path
+- * @param {int} offset
+- * @return {int} status, 
+- *              -1 means recv_file error, 
+- *              -2 means file open failure, 
+- *              EOF means close file error
+- * 
+- */
+-int recv_path(int peer, char *file, uint32_t offset) {
+-    FILE *f = fopen(file, "wb");
+-    if (!f) return -2;
+-    fseek(f, offset, SEEK_SET);
+-    int st = recv_file(peer, f);
+-    int cl = fclose(f);
+-    return st < 0 ? st : cl;
+-}
+-
+-int parse_number(const char *buf, uint32_t *number) {
+-    int f = -1, i;
+-    char tmp[BUF_SIZE] = {0};
+-    int ret = -1;
+-    for (i=0; buf[i]!=0 && i<BUF_SIZE; i++) {
+-        if (!isdigit(buf[i])) {
+-            if (f >= 0) {
+-                memcpy(tmp, &buf[f], i-f);
+-                tmp[i-f] = 0;
+-                *number = atoi(tmp);
+-                ret = 0;
+-                f = -1;
+-                break;
+-            }
+-        } else {
+-            if (f < 0) {
+-                f = i;
+-            }
+-        }
+-    }
+-    return ret;
+-}
+-
+-int parse_addr_port(const char *buf, uint32_t *addr, uint16_t *port) {
+-    int i;
+-    *addr = *port = 0;
+-    int f = -1;
+-    char tmp[BUF_SIZE] = {0};
+-    int cnt = 0;
+-    int portcnt = 0;
+-    for(i=0; buf[i]!=0 && i<BUF_SIZE; i++) {
+-        if(!isdigit(buf[i])) {
+-            if (f >= 0) {
+-                memcpy(tmp, &buf[f], i-f);
+-                tmp[i-f] = 0;
+-                if (cnt < 4) {
+-                    *addr = (*addr << 8) + (0xff & atoi(tmp));
+-                    cnt++;
+-                } else if (portcnt < 2) {
+-                    *port = (*port << 8) + (0xff & atoi(tmp));
+-                    portcnt++;
+-                } else {
+-                    break;
+-                }
+-                f = -1;
+-            }
+-        } else {
+-            if (f < 0) {
+-                f = i;
+-            }
+-        }
+-    }
+-    return cnt == 4 && portcnt == 2;
+-}
+-
+-char * parse_path(const char *buf) {
+-    char * path = (char *)malloc(BUF_SIZE);
++char * parse_path(const char *buf,char *path) {
+     int i, j;
+     for (i=0; buf[i]!=' ' && i < BUF_SIZE; i++);
+     if (i == BUF_SIZE) return NULL;
+@@ -187,8 +27,3 @@ char * parse_path(const char *buf) {
+     return path;
+ }
+ 
+-char * n2a(uint32_t addr) {
+-    uint32_t t = htonl(addr);
+-    return inet_ntoa(*(struct in_addr *)&t);
+-}
+-
+diff --git a/lib/vars.c b/lib/vars.c
+index d1be3d3..8cfe348 100755
+--- a/lib/vars.c
++++ b/lib/vars.c
+@@ -24,11 +24,14 @@ struct ftp_cmd FTP_CMD_LIST[FTP_CMD_COUNT] = {
+     {"HELP", HELP},
+     {"NOOP", NOOP},
+     {"TYPE", TYPE},
++    {"FEAT", FEAT},
+     {"PASV", PASV},
+     {"PORT", PORT},
+     {"SYST", SYST},
+     {"QUIT", QUIT},
+     {"MDTM", MDTM},
+-    {"SIZE", SIZE}
++    {"SIZE", SIZE},
++    {"PBSZ", PBSZ},
++    {"PROT", PROT}
+ };
+ 
+diff --git a/lib/zlog.c b/lib/zlog.c
+index 907d252..01c0842 100644
+--- a/lib/zlog.c
++++ b/lib/zlog.c
+@@ -6,29 +6,29 @@
+ #define FTP_DAEMON  "DAEMON "
+ 
+ void err(int type, const char *fmt, ...) {
+-    printf("\033[22;31m [ EE ] [ %s %d ]: ", type ? FTP_SESSION : FTP_DAEMON, getpid());
++    mbedtls_printf("\033[22;31m [ EE ] [ %s ]: ", type ? FTP_SESSION : FTP_DAEMON);
+     va_list args;
+     va_start(args, fmt);
+     vprintf(fmt, args);
+     va_end(args);
+-    printf("\e[0m\n");
++    mbedtls_printf("\e[0m\n");
+ }
+ 
+ void warn(int type, const char *fmt, ...) {
+-    printf("\033[22;33m [ WW ] [ %s %d ]: ", type ? FTP_SESSION : FTP_DAEMON, getpid());
++    mbedtls_printf("\033[22;33m [ WW ] [ %s ]: ", type ? FTP_SESSION : FTP_DAEMON);
+     va_list args;
+     va_start(args, fmt);
+     vprintf(fmt, args);
+     va_end(args);
+-    printf("\e[0m\n");
++    mbedtls_printf("\e[0m\n");
+ }
+ 
+ void info(int type, const char *fmt, ...) {
+-    printf("\033[22;32m [ II ] [ %s %d ]: ", type ? FTP_SESSION : FTP_DAEMON, getpid());
++    mbedtls_printf("\033[22;32m [ II ] [ %s ]: ", type ? FTP_SESSION : FTP_DAEMON);
+     va_list args;
+     va_start(args, fmt);
+     vprintf(fmt, args);
+     va_end(args);
+-    printf("\e[0m\n");
++    mbedtls_printf("\e[0m\n");
+ }
+ 
+diff --git a/server.c b/server.c
+index 2c8d699..72d0e31 100644
+--- a/server.c
++++ b/server.c
+@@ -1,595 +1,245 @@
+-#include <stdio.h>
+-#define _XOPEN_SOURCE
+-#include <unistd.h>
+-#include <shadow.h>
+-#include <pwd.h>
+-#include <signal.h>
+-#include <string.h>
+-#include <stdlib.h>
+-#include <sys/socket.h>
+-#include <arpa/inet.h>
+-#include <sys/stat.h>
+-#include <sys/types.h>
+-#include <time.h>
+-#include <errno.h>
+-
+-#include "vars.h"
+-#include "zlog.h"
+-#include "utils.h"
+-
+-int server = -1, client = -1, running = 0;
+-pid_t forkpid = 1;
+-char buf[BUF_SIZE];
+-
+-/**
+- * handle Ctrl-C 
+- * 
+- * @param {int} socket fd
+- *
+- * the parent and all its children will recieve kill signal and execute this
+- */
+-void ouch(int n) {
+-    running = 0;
+-    puts("");
+-    if (forkpid > 0) {      // ftpd
+-        if (server >= 0) {
+-            int st = close(server);
+-            info(0, "shutdown ftp ... %d", st);
+-        }
+-    } else {                // session
+-        if (client >= 0) {
+-            int st = close(client);
+-            info(1, "shutdown ftp session... %d", st);
+-        }
+-    }
+-    exit(0);
+-}
+-
+-enum FTP_CMD parse_cmd(char *buf, int len) {
+-    int i,j;
+-    for (i=0; i<FTP_CMD_COUNT; i++) {
+-        for (j=0; FTP_CMD_LIST[i].name[j] != '\0' && j < len; j++) {
+-            if (FTP_CMD_LIST[i].name[j] != buf[j] && FTP_CMD_LIST[i].name[j] != buf[j]-32) break;
+-        }
+-        if (FTP_CMD_LIST[i].name[j] == '\0')
+-            return FTP_CMD_LIST[i].cmd;
+-    }
+-    return INVALID;
+-}
+-
+-/**
+- * handle a newly accepted ftp session
+- *
+- */
+-void handle_session(int client) {
+-    send_str(client, FTP_RDY);
+-    int i, n, retry;
+-    char cwd[BUF_SIZE] = {0}, cmdbuf[BUF_SIZE] = {0};
+-    enum DATA_TYPE datatype = TYPE_IMAGE;
+-    srand(time(0));
+-    uint32_t pasv_port;
+-    enum TRSF_TYPE trsf_type = TRSF_PORT;
+-    int pasv_server = -1;
+-    struct sockaddr_in svr_addr;
+-    int svr_addr_len = sizeof(svr_addr);
+-    getsockname(client, (struct sockaddr*)&svr_addr, &svr_addr_len);
+-    uint32_t svr_host_addr = ntohl(svr_addr.sin_addr.s_addr);
+-    uint32_t port_address = 0;
+-    uint16_t port_port = 0;
+-    int data_client = -1;
+-    struct sockaddr_in data_client_addr;
+-    int data_client_len = sizeof(data_client_addr);
+-    uint32_t restdata = 0;
+-    char rnfr[BUF_SIZE];
+-    char *p = NULL;            // tmp file path
+-    struct stat file_stat;      // file stat for time and size
+-    struct tm mdtime;
+-
+-    /* Updated Nov 8 2016 by @Holmes1st */
+-    /* Variables for login process */
+-    char *input_id;      // inputed user name
+-    char *input_pw;      // inputed password data
+-    char *input_hash;    // hash generated with input id & pw
+-    char shadow_salt[BUF_SIZE];   // parsed from shadow->pwdp
+-    struct spwd *shadow; // shadow data // Check shadow.h
+-    struct passwd *passwd_data; // passwd data for uid, gid  //check pwd.h
+-    int count;
+-    int flag=0;          // 0: not logined  1: id check  2: logined
+-
+-    while ((n=recv(client, buf, BUF_SIZE, MSG_PEEK)) > 0) {
+-        if (!running) break;
+-        buf[n] = '\0';
+-        //info(1, "recved %d bytes: %s", n, buf);
+-        for (i=0; i<n; i++) {
+-            if (buf[i] == '\n') break;
+-        }
+-        if (buf[i] != '\n') {
+-            err(1, "no line break found");
+-            break;
+-        }
+-        n = recv(client, buf, i+1, 0);
+-        buf[n] = '\0';
+-        enum FTP_CMD cmd = parse_cmd(buf, n);
+-        if (cmd < 0) {
+-            buf[n-2] = 0;
+-            err(1, "unknown cmd: %s", buf);
+-            continue;
+-        }
+-        info(1, "cmd: %s, %d", FTP_CMD_LIST[cmd].name, cmd);
+-        if (flag == 0 && cmd != USER && cmd != QUIT || flag == 1 && cmd != PASS && cmd != QUIT){
+-            send_str(client, FTP_NEED_LOGIN);
+-        }
+-        else {
+-            switch(cmd) {
+-                case NOOP:
+-                    send_str(client, FTP_OK);
+-                    break;
+-                case QUIT:
+-                    send_str(client, FTP_QUIT);
+-                    running = 0;
+-                    flag = 0;
+-                    break;
+-                case HELP:
+-                    send_str(client, FTP_HELP);
+-                    break;
+-                case USER:
+-                    input_id = buf;
+-
+-                    // cut id
+-                    while(*(input_id-1) != ' ') input_id++;
+-                    // remove <CRLF>
+-                    for (i = 0; i<strlen(input_id);i++){
+-                        if (input_id[i] == '\r' || input_id[i] == '\n')
+-                            input_id[i] = 0;
+-                    }
+-
+-                    // get shadow data from /etc/shadow
+-                    shadow = getspnam(input_id);
+-                    if (shadow){
+-                        send_str(client, FTP_NAMEOK);
+-                        info(1,"user %s trying to login...",shadow->sp_namp);
+-                        flag = 1;
+-                    }
+-                    else {
+-                        send_str(client, FTP_ERR_NAME);
+-                        info(1, "%s login failed.", input_id);
+-                    }
+-                    // send_str(client, FTP_NAMEOK);
+-                    break;
+-
+-                case PASS:
+-                    input_pw = buf;
+-
+-                    // cut pw
+-                    while (*(input_pw-1) != ' ') input_pw++;
+-                    // remove <CRLF>
+-                    for (i=0;i<strlen(input_pw);i++)
+-                        if (input_pw[i] == '\r' || input_pw[i] == '\n')
+-                            input_pw[i] = 0;
+-
+-                    // get salt from shadow data
+-                    count = 0;
+-                    for(i = 0; i < 3;){
+-                        if (shadow->sp_pwdp[count++] == '$')
+-                            i++;
+-                    }
+-                    strncpy(shadow_salt, shadow->sp_pwdp, count);
+-                    input_hash = crypt(input_pw, shadow_salt);
+-
+-                    if (strcmp(input_hash, shadow->sp_pwdp) == 0){
+-                        send_str(client, FTP_LOGIN);
+-                        info(1, "user %s logged in.", shadow->sp_namp);
+-
+-                        // get data from /etc/passwd for uid and gid
+-                        passwd_data = getpwnam(shadow->sp_namp);
+-                        setgid(passwd_data->pw_gid);
+-                        setuid(passwd_data->pw_uid);
+-                        flag = 2;
+-                    }
+-                    else {
+-                        send_str(client, FTP_LOGIN_FAIL);
+-                        info(1, "user %s:%s logged in fail.", shadow->sp_namp,input_pw);
+-                        flag = 0;
+-                    }
+-                    break;
+-                case PWD:
+-                    getcwd(cwd, sizeof(cwd));
+-                    send_str(client, FTP_PWD, cwd);
+-                    break;
+-                case SYST:
+-                    send_str(client, FTP_SYST);
+-                    break;
+-                case TYPE:
+-                    if (buf[5] == 'A') {
+-                        datatype = TYPE_ASCII;
+-                        send_str(client, FTP_CTYPE, buf[5]);
+-                    } else if (buf[5] == 'I') {
+-                        datatype = TYPE_IMAGE;
+-                        send_str(client, FTP_CTYPE, buf[5]);
+-                    } else {
+-                        send_str(client, FTP_ERR_DATATYPE, datatype == TYPE_ASCII ? 'A' : 'I');
+-                    }
+-                    break;
+-                case PASV:
+-                    retry = 100;
+-                    while (retry--) { // in case of create server error, port used
+-                        pasv_port = (rand() % 64512 + 1024);
+-                        trsf_type = TRSF_PASV;
+-                        pasv_server = new_server(INADDR_ANY, pasv_port, 1);
+-                        if (pasv_server >= 0) break;
+-                    }
+-                    if (pasv_server < 0) {
+-                        err(1, "can not create pasv port for passive mode");
+-                        // TODO: send err msg here
+-                    } else {
+-                        info(1, "PASV server created, port : %hu", pasv_port);
+-                        uint32_t t = svr_addr.sin_addr.s_addr;
+-                        send_str(client, FTP_PASV, t&0xff, (t>>8)&0xff, (t>>16)&0xff, (t>>24)&0xff, pasv_port>>8, pasv_port & 0xff);
+-                    }
+-                    break;
+-                case PORT:
+-                    trsf_type = TRSF_PORT;
+-                    int _st = parse_addr_port(buf, &port_address, &port_port);
+-                    if (!_st) {
+-                        err(1, "port cmd error parsing addr and port");
+-                        send_str(client, FTP_ERR_PORT);
+-                    } else {
+-                        info(1, "address is %s, port is %ld", n2a(port_address), port_port);
+-                        send_str(client, FTP_PORT);
+-                    }
+-                    break;
+-                case LIST:
+-                    if (trsf_type == TRSF_PASV) {
+-                        if (pasv_port > 1024 && pasv_port <= 65535 && pasv_server >= 0) {
+-                            send_str(client, FTP_ASCII, "LIST");
+-                            data_client = accept(pasv_server, (struct sockaddr *)&data_client_addr, &data_client_len);
+-                            if (data_client < 0) {
+-                                err(1, "LIST, accept data client socket error");
+-                            }
+-                        } else {
+-                            err(1, "LIST, no pasv server created");
+-                            break;
+-                        }
+-                    } else if (trsf_type == TRSF_PORT) {
+-                        if (port_address == 0 || port_port == 0) {
+-                            err(1, "LIST, in PORT mode, address and port not set before");
+-                            break;
+-                        }
+-                        send_str(client, FTP_ASCII, "LIST");
+-                        info(1, "LIST, in PORT mode, try connecting %s %lu", n2a(port_address), port_port);
+-                        data_client = new_client(port_address, port_port);
+-                        if (data_client < 0) {
+-                            err(1, "port mode connect client data sock error");
+-                            break;
+-                        } else {
+-                            info(1, "LIST, in PORT mode, %s %lu connected", n2a(port_address), port_port);
+-                        }
+-                    } else {
+-                        err(1, "LIST: transfer type no specified");
+-                    }
+-                    if (data_client >= 0) {
+-                        getcwd(cwd, sizeof(cwd));
+-                        sprintf(cmdbuf, "ls -l %s", cwd);
+-                        FILE *p1 = popen(cmdbuf, "r");
+-                        send_file(data_client, p1);
+-                        send_str(client, FTP_TRSF_OK);
+-                        pclose(p1);
+-                        info(1, "LIST , data client closed, status %d", close(data_client));
+-                        data_client = -1;
+-                    } else {
+-                        err(1, "LIST , no data client created");
+-                    }
+-                    if (pasv_server >= 0) {
+-                        info(1, "LIST, closing passive server ... %d", close(pasv_server));
+-                        pasv_server = -1;
+-                    }
+-                    break;
+-                case REST:
+-                    if (parse_number(buf, &restdata) == 0) {
+-                        send_str(client, FTP_REST, restdata);
+-                    } else {
+-                        err(1, "REST, command error, wrong param");
+-                        send_str(client, FTP_ERR_PARAM, "REST");
+-                    }
+-                    break;
+-                case RETR:
+-                    if (trsf_type == TRSF_PASV) {
+-                        if (pasv_port > 1024 && pasv_port <= 65535 && pasv_server >= 0) {
+-                            if (datatype == TYPE_ASCII) {
+-                                send_str(client, FTP_ASCII, "RETR");
+-                            } else {
+-                                send_str(client, FTP_BIN, "RETR");
+-                            }
+-                            data_client = accept(pasv_server, (struct sockaddr *)&data_client_addr, &data_client_len);
+-                            if (data_client < 0) {
+-                                err(1, "accept data client error");
+-                                break;
+-                            }
+-                        } else {
+-                            err(1, "RETR, pasv server not ready ");
+-                        }
+-                    } else if (trsf_type == TRSF_PORT) {
+-                        if (port_address == 0 || port_port == 0) {
+-                            err(1, "RETR, in PORT mode, address and port not set before");
+-                            break;
+-                        }
+-                        if (datatype == TYPE_ASCII) {
+-                            send_str(client, FTP_ASCII, "RETR");
+-                        } else {
+-                            send_str(client, FTP_BIN, "RETR");
+-                        }
+-                        info(1, "RETR , PORT mode, try connecting %s %lu", n2a(port_address), port_port);
+-                        data_client = new_client(port_address, port_port);
+-                        if (data_client < 0) {
+-                            err(1, "RETR: connect client error ");
+-                        }
+-                    } else {
+-                        err(1, "RETR: transfer type no specified");
+-                        break;
+-                    }
+-                    p = parse_path(buf);
+-                    if (!p) {
+-                        err(1, "RETR, wrong param");
+-                        send_str(1, FTP_ERR_PARAM, "RETR");
+-                        break;
+-                    } else {
+-                        int st = send_path(data_client, p, restdata);
+-                        if (st >= 0) {
+-                            send_str(client, FTP_TRSF_OK);
+-                            restdata = 0;
+-
+-                        /* added controlling permission error */
+-                        } else {
+-                            send_str(client, FTP_ERROR, st == -1 ? (access(p, F_OK)==0? "access denyed. Check Permission" : "file not exist") : "unknow error");
+-                        }
+-                    }
+-                    if (data_client >= 0) {
+-                        info(1, "RETR, closing data client ... %d", close(data_client));
+-                        data_client = -1;
+-                    }
+-                    if (pasv_server >= 0) {
+-                        info(1, "RETR, closing passive server ... %d", close(pasv_server));
+-                        pasv_server = -1;
+-                    }
+-                    break;
+-                case STOR:
+-                    if (trsf_type == TRSF_PASV) {
+-                        if (pasv_port > 1024 && pasv_port <= 65535 && pasv_server >= 0) {
+-                            if (datatype == TYPE_ASCII) {
+-                                send_str(client, FTP_ASCII, "STOR");
+-                            } else {
+-                                send_str(client, FTP_BIN, "STOR");
+-                            }
+-                            data_client = accept(pasv_server, (struct sockaddr *)&data_client_addr, &data_client_len);
+-                            if (data_client < 0) {
+-                                err(1, "STOR, accept data client error");
+-                                break;
+-                            }
+-                        } else {
+-                            err(1, "STOR, pasv server not ready ");
+-                        }
+-                    } else if (trsf_type == TRSF_PORT) {
+-                        if (port_address == 0 || port_port == 0) {
+-                            err(1, "STOR, PORT mode, address and port not set before");
+-                            break;
+-                        }
+-                        if (datatype == TYPE_ASCII) {
+-                            send_str(client, FTP_ASCII, "STOR");
+-                        } else {
+-                            send_str(client, FTP_BIN, "STOR");
+-                        }
+-                        info(1, "STOR, PORT mode, try connecting %s %lu", n2a(port_address), port_port);
+-                        data_client = new_client(port_address, port_port);
+-                        if (data_client < 0) {
+-                            err(1, "STOR: connect client error ");
+-                        }
+-                    } else {
+-                        err(1, "STOR: transfer type no specified");
+-                        break;
+-                    }
+-                    p = parse_path(buf);
+-                    if (!p) {
+-                        err(1, "STOR, wrong param");
+-                        send_str(1, FTP_ERR_PARAM, "RETR");
+-                        break;
+-                    } else {
+-                        int st = recv_path(data_client, p, restdata);
+-                        if (st >= 0) {
+-                            send_str(client, FTP_TRSF_OK);
+-                            restdata = 0;
+-                        /* added controlling permission error */
+-                        } else {
+-                            send_str(client, FTP_ERROR, access(p, W_OK)!=0 ? "access denyed. Check permission" : "unknow error");
+-                        }
+-                    }
+-                    if (data_client >= 0) {
+-                        info(1, "STOR, closing data client ... %d", close(data_client));
+-                        data_client = -1;
+-                    }
+-                    if (pasv_server >= 0) {
+-                        info(1, "STOR, closing passive server ... %d", close(pasv_server));
+-                        pasv_server = -1;
+-                    }
+-                    break;
+-                case CDUP:
+-                    if (!chdir("..")) {
+-                        send_str(client, FTP_CDUP);
+-                    } else {
+-                        send_str(client, FTP_ERROR, "change to parent dir failed");
+-                    }
+-                    break;
+-                case CWD:
+-                    p = parse_path(buf);
+-                    if (!p) {
+-                        err(1, "CWD, wrong param");
+-                        send_str(1, FTP_ERR_PARAM, "CWD");
+-                        break;
+-                    }
+-                    info(1, "chdir \"%s\"", p);
+-                    if (!(chdir(p))) {
+-                        send_str(client, FTP_CWD);
+-                    } else {
+-                        err(1, "errno = %d, errstr is %s", errno, strerror(errno));
+-                        send_str(client, FTP_ERROR, "change dir failed");
+-                    }
+-                    break;
+-                case MDTM:
+-                case SIZE:
+-                    p = parse_path(buf);
+-                    if (!p) {
+-                        if (cmd == MDTM) {
+-                            err(1, "MDTM, wrong param");
+-                            send_str(client, FTP_ERR_PARAM, "MDTM");
+-                        } else {
+-                            err(1, "SIZE, wrong param");
+-                            send_str(client, FTP_ERR_PARAM, "SIZE");
+-                        }
+-                        break;
+-                    } 
+-                    if (stat(p, &file_stat) == 0) {
+-                        if (cmd == MDTM) {
+-                            char _buf[BUF_SIZE];
+-                            gmtime_r(&(file_stat.st_mtime), &mdtime);
+-                            strftime(_buf, sizeof(_buf), "%Y%m%d%H%M%S", &mdtime);
+-                            send_str(client, FTP_MDTM, _buf);
+-                        } else {
+-                            send_str(client, FTP_SIZE, file_stat.st_size);
+-                        }
+-                    }
+-                    break;
+-                case DELE:
+-                    p = parse_path(buf);
+-                    if (!p) {
+-                        err(1, "DELE, param error");
+-                        send_str(client, FTP_ERR_PARAM, "DELE");
+-                    } else {
+-                        if (remove(p) == 0) {
+-                            send_str(client, FTP_DELE);
+-                        } else {
+-                            send_str(client, FTP_ERROR, "delete failed, file not exist ?");
+-                        }
+-                    }
+-                    break;
+-                case RMD:
+-                    p = parse_path(buf);
+-                    if (!p) {
+-                        err(1, "RMD, param error");
+-                        send_str(client, FTP_ERR_PARAM, "RMD");
+-                    } else {
+-                        if (rmdir(p) == 0) {
+-                            send_str(client, FTP_DELE);
+-                        } else {
+-                            send_str(client, FTP_ERROR, "rmdir failed, dir not exist ?");
+-                        }
+-                    }
+-                    break;
+-                case MKD:
+-                    p = parse_path(buf);
+-                    if (!p) {
+-                        err(1, "MKD, param error");
+-                        send_str(client, FTP_ERR_PARAM, "MKD");
+-                    } else {
+-                        if (mkdir(p, 0777) == 0) {
+-                            send_str(client, FTP_MKDIR);
+-                        } else {
+-                            send_str(client, FTP_ERROR, "mkdir failed, dir already exist ?");
+-                        }
+-                    }
+-                    break;
+-                case RNFR:
+-                    p = parse_path(buf);
+-                    if (!p) {
+-                        err(1, "RNFR param error");
+-                        send_str(client, FTP_ERR_PARAM, "RNFR");
+-                    } else {
+-                        strcpy(rnfr, p);
+-                        send_str(client, FTP_RNFR);
+-                    }
+-                    break;
+-                case RNTO:
+-                    p = parse_path(buf);
+-                    if (!p) {
+-                        err(1, "RNTO param error");
+-                        send_str(client, FTP_ERR_PARAM, "RNTO");
+-                    } else {
+-                        if (rename(rnfr, p) == 0) {
+-                            send_str(client, FTP_RNTO);
+-                        } else {
+-                            send_str(client, FTP_ERROR, "rnto error, please check param");
+-                        }
+-                    }
+-                    break;
+-                default:
+-                    send_str(client, FTP_CMDNOIM);
+-                    break;
+-            }
+-        }
+-        if (p) {
+-            free(p);
+-            p = NULL;
+-        }
+-        if (!running) break;
+-    }
+-    info(1, "exiting session ...");
+-    int st = close(client);
+-    info(1, "clent closed , status %d", st);
+-    client = -1;
+-    if (data_client > 0) {
+-        info(1, "data client closed, status %d", close(data_client));
+-    }
+-    if (pasv_server > 0) {
+-        info(1, "pasv server closed, status %d", close(pasv_server));
+-    }
+-}
+-
+-int main(int argc, char *argv[]){
+-    int port = LISTEN_PORT;
+-    if(getuid() != 0){
+-        printf("You need a root permission. Try \"sudo %s\" (or \"su\" as root).\nQuit program....\n",argv[0]);
+-        exit(0);
+-    }
+-    if (argc > 1) {
+-        port = atoi(argv[1]);
+-    }
+-
+-    signal(SIGCHLD, SIG_IGN);   // ignore child termination signal
+-    signal(SIGINT, ouch);       // catch Ctrl-C 
+-    signal(SIGTERM, ouch);
+-
+-    server = new_server(LISTEN_ADDR, port, MAX_CONNECTIONS);
+-    if (server < 0) {
+-        err(0, "can not create server, return code is %d, socket already in use", server);
+-        exit(1);
+-    }
+-
+-    running = 1;
+-
+-    struct sockaddr_in client_addr;
+-    while (running) {
+-        uint32_t l = sizeof(client_addr);
+-        client = accept(server, (struct sockaddr *)&client_addr, &l);
+-
+-        if (!running) break;
+-        if (client < 0) {
+-            err(0, "accept client error: %d", client);
+-            exit(2);
+-        }
+-        info(0, "client connected: %s", inet_ntoa(client_addr.sin_addr));
+-
+-        forkpid = fork();
+-        if (forkpid == -1) {
+-            err(0, "fork server error");
+-        } else if (forkpid == 0) {      // child
+-            server = -1;        // avoid killing server on Ctrl-C
+-            info(0, "new ftp session");
+-            handle_session(client);
+-            exit(0);
+-        } else if (forkpid > 0) {       // myself
+-            client = -1;
+-        }
+-    }
+-    
+-    info(0, "exit ftpd");
+-    return 0;
+-}
+-
++#define _GNU_SOURCE
++#include <unistd.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "vars.h"
++#include "utils.h"
++
++#include "mbedtls/ssl.h"
++#include "mbedtls/net.h"
++
++#include <sgx_uae_service.h>
++#include <Enclave_t.h>
++#include <sgx_trts.h>
++
++#include "Enclave_t.h"  /* print_string */
++
++void mbedtls_printf(const char *fmt, ...)
++{
++    char buf[BUFSIZ] = {'\0'};
++    int ret;
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(buf, BUFSIZ, fmt, ap);
++    va_end(ap);
++    ocall_print_string(&ret,buf);
++}
++
++
++char buf[BUF_SIZE];
++
++enum FTP_CMD parse_cmd(char *buf, int len) {
++    int i,j;
++    for (i=0; i<FTP_CMD_COUNT; i++) {
++        for (j=0; FTP_CMD_LIST[i].name[j] != '\0' && j < len; j++) {
++            if (FTP_CMD_LIST[i].name[j] != buf[j] && FTP_CMD_LIST[i].name[j] != buf[j]-32) break;
++        }
++        if (FTP_CMD_LIST[i].name[j] == '\0')
++            return FTP_CMD_LIST[i].cmd;
++    }
++    return INVALID;
++}
++
++/**
++ * handle a newly accepted ftp session
++ *
++ */
++void handle_ftp_control(mbedtls_ssl_context* ssl, uint32_t ftp_pasv_port, uint32_t ftp_server_ip) {
++    int i, n, ret;
++    char *p = NULL;            // tmp file path
++    int running  = 1;
++    char cwd[256] = {0,};
++    char del[256] = {0,};
++    char buff[256] = {0,};
++    strncpy(cwd,"/",sizeof(cwd));
++
++    send_str(ssl, FTP_RDY);
++    while (running) {
++        for (i=0; i< BUF_SIZE; i++) {
++            if(mbedtls_ssl_read(ssl, (unsigned char *)&buf[i],1) != 1) {
++               mbedtls_printf( "Error in reading FTP SSL stream\n");
++               break;
++            }
++
++
++/*
++      if (ret == MBEDTLS_ERR_SSL_WANT_READ
++            || ret == MBEDTLS_ERR_SSL_WANT_WRITE)
++         continue;
++
++      if (ret <= 0) {
++         switch (ret) {
++         case MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:
++            mbedtls_printf(" connection was closed gracefully\n");
++            ret = 0;
++            goto close_notify;
++
++         case 0:
++         case MBEDTLS_ERR_NET_CONN_RESET:
++            mbedtls_printf(" connection was reset by peer\n");
++            ret = 0;
++            goto reconnect;
++
++         default:
++            mbedtls_printf(" mbedtls_ssl_read returned -0x%x\n", -ret);
++            goto exit;
++         }
++      }
++*/
++
++        if (buf[i] == '\n') break;
++        }
++
++        if (buf[i] != '\n') {
++            mbedtls_printf( "no line break found in FTP steam\n");
++            break;
++        }
++        buf[i] = '\0';
++        n = i+1; //No of characters in the command
++        mbedtls_printf( "recvd %d bytes: %s\n", n, buf);
++        enum FTP_CMD cmd = parse_cmd(buf, n);
++        if (cmd < 0) {
++            buf[n-2] = 0;
++            mbedtls_printf( "unknown cmd: %s\n", buf);
++            continue;
++        }
++        mbedtls_printf("cmd: %s, %d\n", FTP_CMD_LIST[cmd].name, cmd);
++        switch(cmd) {
++                case NOOP:
++                    send_str(ssl, FTP_OK);
++                    break;
++                case QUIT:
++                    send_str(ssl, FTP_QUIT);
++                    running = 0;
++                    break;
++                case HELP:
++                    send_str(ssl, FTP_HELP);
++                    break;
++                case USER:
++                    send_str(ssl, FTP_NAMEOK);
++                    break;
++                case PASS:
++                    send_str(ssl, FTP_LOGIN);
++                    break;
++                case SYST:
++                    send_str(ssl, FTP_SYST);
++                    break;
++                case PWD:
++                    send_str(ssl, FTP_PWD, cwd);
++                    break;
++                case PBSZ:
++                    send_str(ssl, FTP_PBSZ);
++                    break;
++                case PROT:
++                    send_str(ssl, FTP_PBSZ);
++                    break;
++                case CDUP:
++                       for (i=strlen(cwd)-1; i>0 ; i--) {
++                           if (cwd[i-1] == '/') {
++                              cwd[i] = '\0';
++                              break;
++                           }
++                       }
++                       send_str(ssl, FTP_CDUP);
++                       break;
++                case CWD:
++                    p = (char *)malloc(BUF_SIZE);
++                    p = parse_path(buf, p);
++                    if (!p) {
++                        mbedtls_printf("CWD, wrong param\n");
++                        send_str(ssl, FTP_ERR_PARAM, "CWD");
++                        break;
++                    }
++                    mbedtls_printf("chdir \"%s\"\n", p);
++                    if (p[0] == '/')
++                       strncpy(cwd,p,sizeof(cwd));
++                    else if ((p[0] == '.') && (p[0] == '.')) {
++                       for (i=strlen(cwd)-1; i>0 ; i--) {
++                           if (cwd[i-1] == '/') {
++                              cwd[i] = '\0';
++                              break;
++                           }
++                       }
++                    }
++                    else {
++                       strncat(cwd,p,sizeof(cwd)-strlen(cwd));
++                       strncat(cwd,"/",sizeof(cwd)-strlen(cwd));
++                    }
++                    send_str(ssl, FTP_CWD);
++                    if (p)
++                      free(p);
++                    break;
++                case PASV:
++                    mbedtls_printf( "PASV server active, port : %hu\n", ftp_pasv_port);
++                    send_str(ssl, FTP_PASV, (ftp_server_ip>>24)&0xff, (ftp_server_ip>>16)&0xff, (ftp_server_ip>>8)&0xff, ftp_server_ip&0xff,
++                            ftp_pasv_port>>8, ftp_pasv_port & 0xff);
++//                    send_str(ssl, FTP_PASV, 127, 0, 0, 1, \
++//                           ftp_pasv_port>>8, ftp_pasv_port & 0xff);
++                    break;
++                case TYPE:
++                    if (buf[5] == 'A') {
++                        send_str(ssl, FTP_CTYPE, buf[5]);
++                    } else if (buf[5] == 'I') {
++                        send_str(ssl, FTP_CTYPE, buf[5]);
++                    } else {
++                        send_str(ssl, FTP_ERR_DATATYPE);
++                    }
++                    break;
++                case LIST:
++                    send_str(ssl, FTP_ASCII, "LIST");
++                    ocall_handle_ftp_data(5, cwd, &ret);
++                    if (ret == 0) {
++                       send_str(ssl, FTP_TRSF_OK);
++                     } else {
++                       send_str(ssl, FTP_ERROR, "Check folder permissions");
++                     }
++                    break;
++                case RETR:
++                    send_str(ssl, FTP_BIN, "RETR");
++                    p = (char *)malloc(BUF_SIZE);
++                    p = parse_path(buf, p);
++                    if (!p) {
++                        mbedtls_printf( "RETR, wrong param\n");
++                        send_str(ssl, FTP_ERR_PARAM, "RETR");
++                        break;
++                    } else {
++                        snprintf(buff,sizeof(buff),"%s/%s",cwd,p);
++                        ocall_handle_ftp_data(6, buff, &ret);
++                        if (ret >= 0) {
++                            send_str(ssl, FTP_TRSF_OK);
++                        /* added controlling permission error */
++                        } else {
++                            send_str(ssl, FTP_ERROR, "File access error. Check file permission or file does not exist");
++                        }
++                    }
++                    if (p)
++                      free(p);
++                    break;
++                case DELE:
++                    p = (char *)malloc(BUF_SIZE);
++                    p = parse_path(buf, p);
++                    if (!p) {
++                        mbedtls_printf("DELE, wrong param\n");
++                        send_str(ssl, FTP_ERR_PARAM, "DELE");
++                        break;
++                    }
++                    strncpy(del,p,sizeof(del));
++                    mbedtls_printf("Deleting \"%s\"\n", del);
++                    ocall_handle_ftp_data_dele(del, &ret);
++                    if (ret == 0) {
++                       send_str(ssl, FTP_TRSF_OK);
++                     } else {
++                       send_str(ssl, FTP_ERROR, "Check folder permissions");
++                     }
++                    if (p)
++                      free(p);
++                    break;
++                default:
++                    send_str(ssl, FTP_CMDNOIM);
++                    break;
++            }
++        if (!running) break;
++    }
++    mbedtls_printf( "exiting session ...\n");
++}

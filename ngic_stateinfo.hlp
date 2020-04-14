@@ -1,0 +1,1433 @@
+Fri Apr 19 20:56:52 PDT 2019
+----------------------------
+/* Control Plane (CP) state informations && hash tables */
+---------------------------------------------------------------
+@~/cp/ue.h::
+extern struct rte_hash *ue_context_by_imsi_hash;
+extern struct rte_hash *ue_context_by_fteid_hash;
+
+extern apn apn_list[MAX_NB_DPN];
+
+typedef struct apn_t {
+	char *apn_name_label;
+	size_t apn_name_length;
+	uint8_t apn_idx;
+} apn;
+
+typedef struct ue_ippool_t {
+	int hosts;                      /* max. possible hosts */
+	struct in_addr netmask;         /* subnetmask */
+	struct in_addr netid;           /* network id */
+} ue_ippool;
+
+/* LINK::
+	imsi::key->ue_context_by_imsi_hash, value= ue_context */
+
+/* LINK::
+	s11_sgw_gtpc_teid::key->ue_context_by_fteid_hash, value= ue_context */
+
+typedef struct ue_context_t {
+	/* LINK::key->ue_context_by_imsi_hash, value= ue_context */
+	uint64_t imsi;
+	uint8_t unathenticated_imsi;
+	uint64_t mei;
+	uint64_t msisdn;
+
+	ambr_ie mn_ambr;
+
+	/* LINK::key->ue_context_by_fteid_hash, value= ue_context */
+	uint32_t s11_sgw_gtpc_teid;
+	struct in_addr s11_sgw_gtpc_ipv4;
+	uint32_t s11_mme_gtpc_teid;
+	struct in_addr s11_mme_gtpc_ipv4;
+
+	uint16_t bearer_bitmap;
+	uint16_t teid_bitmap;
+	uint8_t num_pdns;
+
+	/* LINK::pdn_connection */
+	struct pdn_connection_t *pdns[MAX_BEARERS];
+	struct eps_bearer_t *eps_bearers[MAX_BEARERS]; /* index by ebi - 5 */
+
+	struct eps_bearer_t *ded_bearer;
+
+	/* ASR- TMOPL VCCCCB-21
+	 * NGIC state info re-design for billing and LI
+	 */
+	selection_mode_ie_t seletion_mode;
+	pdn_type_ie_t pdn_type;
+	paa_ie_t paa;
+	ue_timezone_ie_t ue_timezone;
+	charging_char_ie_t charging_characteristics;
+	struct session_info *dp_session; /* session_info: CP CDR collation handle */
+} ue_context;
+
+typedef struct pdn_connection_t {
+	apn *apn_in_use;
+	ambr_ie apn_ambr;
+	uint32_t apn_restriction;
+
+	ambr_ie session_ambr;
+	ambr_ie session_gbr;
+
+	struct in_addr ipv4;
+	struct in6_addr ipv6;
+
+	uint32_t s5s8_sgw_gtpc_teid;
+	struct in_addr s5s8_sgw_gtpc_ipv4;
+
+	uint32_t s5s8_pgw_gtpc_teid;
+	struct in_addr s5s8_pgw_gtpc_ipv4;
+
+	pdn_type_ie pdn_type;
+
+	/* LINK::charging_characteristics_ie */
+	charging_characteristics_ie charging_characteristics;
+
+	uint8_t default_bearer_id;
+
+	struct eps_bearer_t *eps_bearers[MAX_BEARERS]; /* index by ebi - 5 */
+
+	struct eps_bearer_t *packet_filter_map[MAX_FILTERS_PER_UE];
+} pdn_connection;
+
+typedef struct eps_bearer_t {
+	uint8_t eps_bearer_id;
+
+	bearer_qos_ie qos;
+
+	uint32_t charging_id;
+
+	struct in_addr s1u_sgw_gtpu_ipv4;
+	uint32_t s1u_sgw_gtpu_teid;
+	struct in_addr s5s8_sgw_gtpu_ipv4;
+	uint32_t s5s8_sgw_gtpu_teid;
+	struct in_addr s5s8_pgw_gtpu_ipv4;
+	uint32_t s5s8_pgw_gtpu_teid;
+	struct in_addr s1u_enb_gtpu_ipv4;
+	uint32_t s1u_enb_gtpu_teid;
+
+	struct in_addr s11u_mme_gtpu_ipv4;
+	uint32_t s11u_mme_gtpu_teid;
+
+	/* LINK::pdn_connection */
+	struct pdn_connection_t *pdn;
+
+	int packet_filter_map[MAX_FILTERS_PER_UE];
+	uint8_t num_packet_filters;
+} eps_bearer;
+
+@~/cp/gtpv2c_ie.h::
+/**
+ * IE specific data for Charging Characteristics as defined by
+ * 3GPP TS 29.274, clause 8.30 for the IE type value 95.
+ *
+ * Charging characteristics information element is defined in 3GPP TS 32.251
+ *
+ * For the encoding of this information element see 3GPP TS 32.298
+ */
+typedef struct charging_characteristics_ie_t {
+	uint8_t b0 :1;
+	uint8_t b1 :1;
+	uint8_t b2 :1;
+	uint8_t b3 :1;
+	uint8_t b4 :1;
+	uint8_t b5 :1;
+	uint8_t b6 :1;
+	uint8_t b7 :1;
+	uint8_t b8 :1;
+	uint8_t b9 :1;
+	uint8_t b10 :1;
+	uint8_t b11 :1;
+	uint8_t b12 :1;
+	uint8_t b13 :1;
+	uint8_t b14 :1;
+	uint8_t b15 :1;
+} charging_characteristics_ie;
+
+---------------------------------------------------------------
+---------------------------------------------------------------
+
+/* Data Plane (DP) state informations && hash tables */
+---------------------------------------------------------------
+/* ------------------------------------------------------------
+* ASR- Packet Processing on wire
+* ---------------------------------------------------------- */
+@~/dp/pkt_handler.c::
+	s1u_pkt_handler(struct rte_pipeline *p, struct rte_mbuf **pkts, uint32_t n,
+			int wk_index)
+	{
+		...
+		case SPGWU:
+		{
+			gtpu_decap(pkts, n, &pkts_mask);
+			filter_ul_traffic(p, pkts, n, wk_index, &pkts_mask)
+			{
+				@~/dp/dataplane.c::
+				/* LINK::
+					ul_bm_key::key->rte_uplink_hash, value= dp_sdf_per_bearer_info */
+				struct rte_hash *rte_uplink_hash;
+
+				ul_sess_info_get(struct rte_mbuf **pkts, uint32_t n,
+					uint64_t *pkts_mask, struct dp_sdf_per_bearer_info **sess_info)
+				{
+					struct ul_bm_key key[MAX_BURST_SZ];
+					...
+					for (j = 0; j < n; j++) {
+						...
+						key[j].rid =1; /* Hard coding rule id to 1. (temporary fix) */
+						key[j].s1u_sgw_teid = meta_data->teid;
+						...
+							return rte_hash_lookup_bulk_data(
+									rte_uplink_hash, key, n, hit_mask, value);
+						...
+					}
+				}
+			}
+			...
+			update_nexthop_info(pkts, n, &pkts_mask, next_port, &sdf_info[0])::
+			@~/dp/dataplane.c::
+			update_nexthop_info(struct rte_mbuf **pkts, uint32_t n,
+					uint64_t *pkts_mask, uint8_t portid,
+					struct dp_sdf_per_bearer_info **sess_info)
+			{
+				...
+				@~/dp/ether.c::
+				construct_ether_hdr(struct rte_mbuf *m, uint8_t portid,
+						struct dp_sdf_per_bearer_info **sess_info)
+				{
+					...
+					tmp_arp_key.ip = app.sgi_gw_ip;
+					...
+					ret_arp_data = retrieve_arp_entry(tmp_arp_key, portid);
+					...
+					ether_addr_copy(&ret_arp_data->eth_addr, &eth_hdr->d_addr);
+					ether_addr_copy(&ports_eth_addr[portid], &eth_hdr->s_addr);
+					...
+				}
+				...
+			}
+		}
+		...
+	}
+
+@~/dp/pkt_handler.c::
+	sgi_pkt_handler(struct rte_pipeline *p, struct rte_mbuf **pkts, uint32_t n,
+			int wk_index)
+	{
+		...
+		case SPGWU:
+		{
+			/* Filter Downlink traffic. Apply adc, sdf, pcc*/
+			pkts_mask =
+			filter_dl_traffic(p, pkts, n, wk_index, sdf_info, si)
+			{
+				@~/dp/dataplane.c::
+				/* LINK::
+					dl_bm_key::key->rte_downlink_hash, value= dp_sdf_per_bearer_info */
+					struct rte_hash *rte_downlink_hash;
+
+					dl_sess_info_get(struct rte_mbuf **pkts, uint32_t n,
+							uint64_t *pkts_mask, struct dp_sdf_per_bearer_info **sess_info,
+							struct dp_session_info **si)
+					{
+						struct dl_bm_key key[MAX_BURST_SZ];
+						...
+						for (j = 0; j < n; j++) {
+							key[j].rid =1; /* Hard coding rule id to 1. (temporary fix) */
+							...
+								case SPGWU: {
+									...
+									dst_addr = ntohl(ipv4_hdr->dst_addr);
+								}
+							...
+							key[j].ue_ipv4 = dst_addr;
+							...
+								return rte_hash_lookup_bulk_data(
+										rte_downlink_hash, key, n, hit_mask, value);
+							...
+							si[j] = sess_info[j]->bear_sess_info;
+						}
+					}
+			}
+			...
+			gtpu_encap(&si[0], pkts, n, &pkts_mask, &pkts_queue_mask)::
+			@~/dp/dataplane.c::
+			gtpu_encap(struct dp_session_info **sess_info, struct rte_mbuf **pkts,
+					uint32_t n, uint64_t *pkts_mask, uint64_t *pkts_queue_mask)
+			{
+				...
+				struct dp_session_info *si;
+				for (i = 0; i < n; i++) {
+					si = sess_info[i];
+					m = pkts[i];
+					...
+					if (ENCAP_GTPU_HDR(m, si->dl_s1_info.enb_teid) < 0) {...}
+				}
+			}
+			...
+		}
+		...
+		update_nexthop_info(pkts, n, &pkts_mask, next_port, &sdf_info[0])::
+		@~/dp/dataplane.c::
+		update_nexthop_info(struct rte_mbuf **pkts, uint32_t n,
+				uint64_t *pkts_mask, uint8_t portid,
+				struct dp_sdf_per_bearer_info **sess_info)
+		{
+			...
+			@~/dp/ether.c::
+			construct_ether_hdr(struct rte_mbuf *m, uint8_t portid,
+					struct dp_sdf_per_bearer_info **sess_info)
+			{
+				...
+				tmp_arp_key.ip = app.s1u_gw_ip;
+				...
+				ret_arp_data = retrieve_arp_entry(tmp_arp_key, portid);
+				...
+				ether_addr_copy(&ret_arp_data->eth_addr, &eth_hdr->d_addr);
+				ether_addr_copy(&ports_eth_addr[portid], &eth_hdr->s_addr);
+				...
+			}
+			...
+		}
+	}
+
+/* ------------------------------------------------------------
+* ASR- Session establishment & rule association
+* ---------------------------------------------------------- */
+struct rte_hash *rte_uplink_hash;
+struct rte_hash *rte_downlink_hash;
+struct rte_hash *rte_adc_hash;
+struct rte_hash *rte_adc_ue_hash;
+struct rte_hash *rte_sess_hash;
+struct rte_hash *rte_ue_hash;
+struct rte_hash *rte_sdf_pcc_hash;
+struct rte_hash *rte_adc_pcc_hash;
+
+/* LINK::
+	ue_sess_id::key->rte_ue_hash, value= ue_session_info */
+@~/dp/dataplane.c::
+	struct rte_hash *rte_ue_hash;
+
+@~/cp_dp_api/vepc_cp_dp_api.h::
+	/* using ue ipv4 addr as unique identifier for a UE.
+	 * sess_id is combination of ue addr and bearer id.
+	 * set sess_id = (ue_ipv4_addr << 4) | bearer_id
+	 */
+	#define UE_SESS_ID(x) (x>>4)
+@~/dp/sess_table.c::
+	dp_session_create(struct dp_id dp_id,
+			struct session_info *entry)
+	{
+		struct dp_session_info *data;
+		struct ue_session_info *ue_data = NULL;
+		...
+		uint32_t ue_sess_id = UE_SESS_ID(entry->sess_id);
+		...
+		data = get_session_data(entry->sess_id, SESS_CREATE);
+		...
+		ret = rte_hash_lookup_data(rte_ue_hash, &ue_sess_id, (void **)&ue_data);
+		...
+		ret = rte_hash_add_key_data(rte_ue_hash, &ue_sess_id, ue_data);
+		...
+	}
+
+@~/dp/pipeline/epc_packet_framework.h::
+	/** UL Bearer Map key for hash lookup.*/
+	struct ul_bm_key {
+		/** s1u teid */
+		uint32_t s1u_sgw_teid;
+		/** rule id*/
+		uint32_t rid;
+	};
+
+	/** DL Bearer Map key for hash lookup */
+	struct dl_bm_key {
+		/** Ue ip */
+		uint32_t ue_ipv4;
+		/** Rule id */
+		uint32_t rid;
+	};
+
+@~/dp/main.h::
+/**
+ * Bearer Session information structure
+ */
+struct dp_session_info {
+	struct ip_addr ue_addr;				/**< UE ip address*/
+	struct ul_s1_info ul_s1_info;			/**< UpLink S1u info*/
+	struct dl_s1_info dl_s1_info;			/**< DownLink S1u info*/
+	uint8_t linked_bearer_id;				/**< Linked EPS Bearer ID (LBI)*/
+
+	/* PCC rules related params*/
+	uint32_t num_ul_pcc_rules;			/**< No. of UL PCC rule*/
+	uint32_t ul_pcc_rule_id[MAX_PCC_RULES];		/**< PCC rule id supported in UL*/
+	uint32_t num_dl_pcc_rules;			/**< No. of PCC rule*/
+	uint32_t dl_pcc_rule_id[MAX_PCC_RULES];		/**< PCC rule id*/
+
+	/* Charging Data Records*/
+	struct ipcan_dp_bearer_cdr ipcan_dp_bearer_cdr;	/**< IP CAN bearer CDR*/
+
+	uint32_t client_id;
+	uint64_t sess_id;						/**< session id of this bearer
+									 * last 4 bits of sess_id
+									 * maps to bearer id*/
+	uint32_t service_id;						/**< Type of service given
+									 * to this session like
+									 * Internet, Management, CIPA etc
+									 */
+	struct ue_session_info *ue_info_ptr;	/**< Pointer to UE info of this bearer */
+
+	/** Session state for use with downlink data processing*/
+	enum dp_session_state sess_state;
+	/** Ring to hold the DL pkts for this session */
+	struct rte_ring *dl_ring;
+} __attribute__((packed, aligned(RTE_CACHE_LINE_SIZE)));
+
+/**
+ * UE Session information structure
+ */
+struct ue_session_info {
+	struct ip_addr ue_addr;			/**< UE ip address*/
+	uint32_t bearer_count;			/**< Num. of bearers configured*/
+	struct rte_meter_srtcm ul_apn_mtr_obj;
+	/**< UL APN meter object pointer*/
+	struct rte_meter_srtcm dl_apn_mtr_obj;
+	/**< DL APN meter object pointer*/
+
+	/* rating groups CDRs*/
+	struct rating_group_index_map rg_idx_map[MAX_RATING_GRP]; /**< Rating group index*/
+	struct ipcan_dp_bearer_cdr rating_grp[MAX_RATING_GRP];	/**< rating groups CDRs*/
+	uint32_t ul_apn_mtr_idx;	/**< UL APN meter profile index*/
+	uint32_t dl_apn_mtr_idx;	/**< DL APN meter profile index*/
+	uint64_t ul_apn_mtr_drops;	/**< drop count due to ul apn metering*/
+	uint64_t dl_apn_mtr_drops;	/**< drop count due to dl apn metering*/
+
+	/* ADC rules related params*/
+	uint32_t num_adc_rules;					/**< No. of ADC rule*/
+	uint32_t adc_rule_id[MAX_ADC_RULES]; 	/**< list of ADC rule id*/
+} __attribute__((packed, aligned(RTE_CACHE_LINE_SIZE)));
+
+/**
+ * SDF and Bearer specific information structure
+ */
+struct dp_sdf_per_bearer_info {
+	struct dp_pcc_rules pcc_info;						/**< PCC info of this bearer */
+	struct rte_meter_srtcm sdf_mtr_obj;					/**< meter object for this SDF flow */
+	struct ipcan_dp_bearer_cdr sdf_cdr;					/**< per SDF bearer CDR*/
+	struct dp_session_info *bear_sess_info;  	/**< pointer to bearer this flow belongs to */
+	uint64_t sdf_mtr_drops;								/**< drop count due to sdf metering*/
+} __attribute__((packed, aligned(RTE_CACHE_LINE_SIZE)));
+
+
+/* Note: LINK::send_ddn_request(struct dp_session_info *si) {...} */
+
+@~/cp_dp_api/vepc_cp_dp_api.h::
+/**
+ * Bearer Session information structure
+ */
+struct session_info {
+	/* ASR- TMOPL VCCCCB-25
+	 * Reference @DP session_info:: apn_idx, ue_context, pdn_connection
+	 */
+	void *dp_session;							/* session_info: CP CDR collation handle */
+	void *ue_context;							/* ue_context: CP CDR collation handle */
+	struct pdn_connection_t *pdn_context;		/* pdn_connection: CP CDR collation handle */
+
+	/* ASR- TODO >> DONE:
+		void *ue_context;
+		uint8_t apn_idx;
+	*/
+	uint8_t apn_idx;							/* apn reference to DP */
+	void *ue_context;							/* ue_context reference to DP */
+	struct ip_addr ue_addr;							/* UE ip address*/
+	struct ul_s1_info ul_s1_info;					/* UpLink S1u info*/
+	struct dl_s1_info dl_s1_info;					/* DownLink S1u info*/
+	uint8_t bearer_id;								/* Bearer ID*/
+
+	/* PCC rules related params*/
+	uint32_t num_ul_pcc_rules;						/* No. of UL PCC rule*/
+	uint32_t ul_pcc_rule_id[MAX_PCC_RULES]; 		/* PCC rule id supported in UL*/
+	uint32_t num_dl_pcc_rules;						/* No. of PCC rule*/
+	uint32_t dl_pcc_rule_id[MAX_PCC_RULES];			/* PCC rule id*/
+
+	/* ADC rules related params*/
+	uint32_t num_adc_rules;							/* No. of ADC rule*/
+	uint32_t adc_rule_id[MAX_ADC_RULES]; 			/* List of ADC rule id*/
+
+	/* Charging Data Records*/
+	struct ipcan_dp_bearer_cdr ipcan_dp_bearer_cdr;	/* Charging Data Records*/
+	uint32_t client_id;
+
+	uint64_t op_id;
+
+	uint64_t sess_id;								/* session id of this bearer
+									 				* last 4 bits of sess_id
+									 				* maps to bearer id*/
+	uint32_t service_id;							/* Type of service given
+									 				* given to this session like
+									 				* Internet, Management, CIPA etc
+									 				*/
+	uint32_t ul_apn_mtr_idx;						/* UL APN meter profile index*/
+	uint32_t dl_apn_mtr_idx;						/* DL APN meter profile index*/
+} __attribute__((packed, aligned(RTE_CACHE_LINE_SIZE)));
+
+/**
+ * UpLink S1u interface config structure.
+ */
+struct ul_s1_info {
+	uint32_t sgw_teid;		/* SGW teid*/
+	struct ip_addr enb_addr;	/* eNodeB address*/
+	struct ip_addr sgw_addr;	/* Serving Gateway address*/
+	struct ip_addr s5s8_pgwu_addr;	/* S5S8_PGWU address*/
+} __attribute__((packed, aligned(RTE_CACHE_LINE_SIZE)));
+
+/**
+ * DownLink S1u interface config structure.
+ */
+struct dl_s1_info {
+	uint32_t enb_teid;		/* eNodeB teid*/
+	struct ip_addr enb_addr;	/* eNodeB address*/
+	struct ip_addr sgw_addr;	/* Serving Gateway address*/
+	struct ip_addr s5s8_sgwu_addr;	/* S5S8_SGWU address*/
+} __attribute__((packed, aligned(RTE_CACHE_LINE_SIZE)));
+
+/**
+ * Volume based Charging
+ */
+struct chrg_data_vol {
+	struct cdr ul_cdr;								/* Uplink cdr*/
+	struct cdr dl_cdr;								/* Downlink cdr*/
+	struct cdr ul_drop;								/* Uplink dropped cdr*/
+	struct cdr dl_drop;								/* Downlink dropped cdr*/
+};
+
+/**
+ * Rating group index mapping Data structure.
+ */
+struct rating_group_index_map {
+	uint32_t rg_val;								/* Rating group*/
+	uint8_t rg_idx;									/* Rating group index*/
+};
+
+/**
+ * IP-CAN Bearer Charging Data Records
+ */
+struct ipcan_dp_bearer_cdr {
+	uint32_t charging_id;							/* Bearer Charging id*/
+	uint32_t pdn_conn_charging_id;					/* PDN connection charging id*/
+	struct tm record_open_time;						/* Record time*/
+	uint64_t duration_time;							/* duration (sec)*/
+	uint8_t	record_closure_cause;					/* Record closure cause*/
+	uint64_t record_seq_number;						/* Sequence no.*/
+	uint8_t charging_behavior_index; 				/* Charging index*/
+	uint32_t service_id;							/* to identify the service
+						 							* or the service component
+						 							* the bearer relates to*/
+	char sponsor_id[MAX_DNS_SPON_ID_LEN];			/* identify the 3rd party organization (the
+						 							* sponsor) willing to pay operator's charge*/
+	struct service_data_list service_data_list; 	/* List of service*/
+	uint32_t rating_group;							/* rating group of this bearer*/
+/* ASR- TODO >> DONE:
+Note:
+	vol_threshold & tmr_threshold @cp_config.cfg per APN
+	ipcan_dp_bearer_cdr needs to be populated correctly on call to sesstion_create by CP
+
+	uint64_t tmr_threshold;
+*/
+	uint64_t tmr_trshld;			/* timer threshold in seconds */
+	uint64_t vol_trshld;			/* volume threshold in MBytes */
+	struct chrg_data_vol data_vol;					/* charing per UE by volume*/
+	uint32_t charging_rule_id;						/* Charging Rule ID*/
+} __attribute__((packed, aligned(RTE_CACHE_LINE_SIZE)));
+
+/* ----------------------------------------------------------------------------------------
+					DP Thread's Details
+-------------------------------------------------------------------------------------------
+THREAD				FLOW						FILE					FUNCTION
+-------------------------------------------------------------------------------------------
+	1	main()									main.c					main()
+			->epc_lcore_main_loop()
+			->epc_run_pipeline()
+			->epc_arp()
+			->epc_stats_core()
+			->cmdline_poll()
+	2	mp_handle() 							eal_common_proc.c		rte_mp_channel_init()
+	3	eal_intr_thread_main() 					eal_interrupts.c		rte_eal_intr_init()
+	4	eal_thread_loop()						epc_packet_framework.c	epc_iface_core()
+			->epc_lcore_main_loop()
+			->epc_run_pipeline()
+			->epc_iface_core()
+	5	eal_thread_loop()						epc_ul.c				epc_ul()
+			->epc_lcore_main_loop()
+			->epc_run_pipeline()
+			->epc_ul()
+	6	eal_thread_loop()						epc_dl.c				epc_dl()
+			->epc_lcore_main_loop()
+			->epc_run_pipeline()
+			->epc_dl()
+	7	start_thread()							epc_arp.c				init_netlink_socket()
+			->netlink_recv_thread()
+	8	epoll_wait ()							zmq library
+	9	epoll_wait ()							zmq library
+	10	epoll_wait ()							zmq library
+	11	epoll_wait ()							zmq library
+		Backtrace for Threads 8-11:
+		(gdb) bt
+			#0  0x00007ffff6336a13 in epoll_wait () at ../sysdeps/unix/syscall-template.S:84
+			#1  0x00007ffff6a491ac in ?? () from /usr/lib/x86_64-linux-gnu/libzmq.so.5
+			#2  0x00007ffff6a748ba in ?? () from /usr/lib/x86_64-linux-gnu/libzmq.so.5
+			#3  0x00007ffff66006ba in start_thread (arg=0x7fff7d7fb700) at pthread_create.c:333
+			#4  0x00007ffff633641d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
+NOTE: All these threads(11) are started by main core
+
+------------------------------------------------------------------------------------------------*/
+/* ------------------------------------------------------------
+* ASR- TODO List  Begin
+* ---------------------------------------------------------- */
+TODO >> DONE:
+Thu May  2 17:02:57 PDT 2019
+1:
+@~/dp/pkt_handler.c::
+	s1u_pkt_handler(struct rte_pipeline *p, struct rte_mbuf **pkts, uint32_t n,
+		int wk_index) {
+		...
+		case SPGWU: {
+			gtpu_decap(pkts, n, &pkts_mask);
+			filter_ul_traffic(p, pkts, n, wk_index, &pkts_mask);
+			...
+		}
+		...
+		/* ASR- TODO >> DONE: BUG sdf_info[0] == NULL */
+		/* Note: sdf_info[0] only for sgw_s5_s8_pkt_handler(...)
+		*       Updated by update_enb_info(...) */
+		update_nexthop_info(pkts, n, &pkts_mask, next_port, &sdf_info[0]);
+	}
+
+	sgi_pkt_handler(struct rte_pipeline *p, struct rte_mbuf **pkts, uint32_t n,
+		int wk_index) {
+		...
+		case SPGWU: {
+			/* Filter Downlink traffic. Apply adc, sdf, pcc*/
+			pkts_mask = filter_dl_traffic(p, pkts, n, wk_index, sdf_info, si);
+			...
+			gtpu_encap(&si[0], pkts, n, &pkts_mask, &pkts_queue_mask);
+			...
+		}
+		...
+		/* ASR- TODO >> DONE: BUG sdf_info[0] == NULL */
+		/* Note: sdf_info[0] only for sgw_s5_s8_pkt_handler(...)
+		*       Updated by update_enb_info(...) */
+		update_nexthop_info(pkts, n, &pkts_mask, next_port, &sdf_info[0]);
+	}
+
+2:
+@~/dp/pkt_handler.c, dp/dataplane.c, dp/sess_table.c, dp/stats.c
+/* ASR- TODO >> DONE: Remove #ifdef NGCORE_SHRINK across the files */
+
+
+Fri May  3 07:15:32 PDT 2019
+3:
+/* ASR- TODO Remove *.orig, *wrk files after testing with Spirent is done */
+
+Sun May  5 17:47:51 PDT 2019
+/* ASR- TODO >> DONE */
+	Moved Frag + Re-assy defines, vars and extrns to main.h head.
+	Re-organized main.h head defines and var declarations
+	Re-named REASSY_MAXFLOWS to MAX_SESSIONS
+	Moved IP_FRAG_TBL_BUCKET_ENTRIES init.c >>  main.h
+
+	Created dp_sess_strct, nb_sess for CLI monitoring
+
+Wed May 15 20:45:36 PDT 2019:
+/* ASR- TODO: Remove/dilute the usage of pkt data copy to epc_meta */
+@~/dp/pipeline/epc_packet_framework.h::
+	struct epc_meta_data {
+		...
+		/** eNB IP from GTP-U */
+		uint32_t enb_ipv4;
+		/** Teid from GTP-U */
+		uint32_t teid;
+		/** DL Bearer Map key */
+		struct dl_bm_key key;
+	};
+@~/dp/dataplane.c::
+	gtpu_decap(...) {
+		...
+		/* ASR- teid & enb_ipv4 copied for ul_sess_info_get(...) */
+		meta_data->teid = ntohl(gtpu_hdr->teid);
+		meta_data->enb_ipv4 = ntohl(ipv4_hdr->src_addr);
+		...
+	}
+	ul_sess_info_get(...) {
+		...
+			case SPGWU: {
+			/* ASR- teid & enb_ipv4 used for ul_sess_info_get(...) */
+				meta_data =
+					(struct epc_meta_data *)RTE_MBUF_METADATA_UINT8_PTR(pkts[j],
+					META_DATA_OFFSET);
+				key[j].s1u_sgw_teid = meta_data->teid;
+		...
+	}
+	dl_sess_info_get(...) {
+		...
+		/* ASR- ue_ipv4, rid copied to meta. BUT NOT USED anywhere */
+		meta_data->key.ue_ipv4 = key[j].ue_ipv4;
+		meta_data->key.rid = key[j].rid;
+		...
+	}
+
+Sun May 19 17:15:26 PDT 2019
+/* ASR- TODO >> DONE: @/cp/gtpv2c_messages/create_session.c::
+	ACTION: Delete commented code & related declarations @ue.h */
+	//	apn *apn_requested = get_apn((char *)csr.apn.apn, csr.apn.header.len);
+
+/* ASR- TODO >> DONE: Investigate cp startup issue:: */
+del_resp_op_id: rte_hash_lookup_data failed for op_id 12620: No such file or directory (4294967294)
+
+/* ASR- TODO >> DONE: @~/cp/gtpv2c_messages/create_s5s8_session.c::
+	process_pgwc_s5s8_create_session_request(...):: casue_res != 0 */
+	ln #248  if (cause_res == 0) {
+				cause_res = GTPV2C_CAUSE_REQUEST_ACCEPTED;
+				...
+			/* ASR- TODO } else {
+			 * */
+			return cause_res;
+			}
+
+Tue May 21 18:20:10 PDT 2019
+/* ASR- TODO >> DONE: List:
+
+	Move to vepc_cp_dp_api.h::
+		#define MAX_NB_APN                   8
+
+	Add @struct session_info {
+	void *ue_context;
+	uint8_t apn_idx;
+
+	Add @struct ipcan_dp_bearer_cdr {
+	Note:
+		vol_threshold & tmr_threshold @cp_config.cfg per APN
+		ipcan_dp_bearer_cdr needs to be populated correctly on call to sesstion_create by CP
+
+		uint64_t tmr_threshold;
+*/
+
+/* ASR- TODO:
+	Check need for separate SIMU core on CP
+*/
+
+Mon May 27 08:14:58 PDT 2019
+/* ASR- TODO >> DONE: Review ~/libgtpv2c/src/decoder.c w.r.t:: */
+	set_create_session_response(...) {...
+		set_ipv4_paa(&cs_resp.paa, IE_INSTANCE_ZERO, pdn->ipv4);
+		...
+		/* Set the PCO variables in CS response */
+		set_pco(&cs_resp.pco, IE_INSTANCE_ZERO,
+				primary_dns_ip, secondary_dns_ip);
+		...
+	}
+
+Tue May 28 21:00:28 PDT 2019
+/* ASR- TODO >> DONE: Check struct cdr_msg wrt to TMOPL requirement xlsx */
+@~/interface/ipc/dp_ipc_api.h::
+	struct cdr_msg {
+		uint32_t ratingGroup;
+		uint64_t localSequenceNumber;
+		uint64_t timeOfFirstUsage;
+		uint64_t timeOfLastUsage;
+		uint64_t timeUsage;
+		uint8_t record_closure_cause;
+		uint64_t datavolumeFBCUplink;
+		uint64_t datavolumeFBCDownlink;
+		uint64_t timeOfReport;//TODO: CP will report
+		void *ue_context;
+		uint32_t apn_idx;
+	};
+
+Fri May 31 16:23:27 PDT 2019
+/* ASR- TODO >> DONE: Align dpn_id @nb.h w/ dp_ip.name @cp_dp_api.h */
+struct dp_id {
+	uint64_t id;			/* table identifier. */
+	char name[MAX_LEN];		/* name string of identifier */
+} __attribute__((packed, aligned(RTE_CACHE_LINE_SIZE)));
+
+
+/* ASR- TODO >> DONE: ||| to ~/cp/create_session.c align w/
+~/libgtpv2c/src/decoder.c w.r.t:: */
+	@~/cp/gtpv2c_messages/create_s5s8_session.c::
+	parse_pgwc_s5s8_create_session_request(...)
+	@~/cp/delete_s5s8_session.c
+
+Wed May 29 18:59:17 PDT 2019
+/* ASR- TODO >> DONE: Check on modify bearer request:: */
+	serviceConditionChange	ECGI Change, TAI Change
+
+Fri May 31 20:28:34 PDT 2019
+/* ASR- TODO >> DONE: Check w/ Somnath::
+	ssl_client.c failure with CP makefile
+	interface.c: read_config app.* config values
+		1133 #ifdef TBD /* SGX_BUILD
+		1134     app.dealer_in_ip = rte_cfgfile_get_entry(file, "0",
+*/
+/* ASR- TODO >> DONE: Action Suresh::
+	check install.sh operation */
+
+Sun Jun  2 12:44:04 PDT 2019
+/* ASR- TODO >> DONE: Check purpose */
+	@~/cp/main.c::
+	init_cp(void) {
+		...
+	iface_module_constructor();
+		if (signal(SIGINT, sig_handler) == SIG_ERR)
+			rte_exit(EXIT_FAILURE, "Error:can't catch SIGINT\n");
+		...
+	}
+/* ASR- TODO >> DONE: Check compilation error */
+	@~/cp_dp_api/vepc_cp_dp_api.h::
+	struct session_info {
+		...
+		struct pdn_connection_t *pdn_context;				/* pdn_connection reference to DP */
+	}
+
+Tue Jun  4 19:26:03 PDT 2019
+/*ASR- TODO >> DONE: Issue multiple PDN connection request on same IMSI @given APN:: */
+	Trace cp_sync create, modify, delete response messages
+
+Sat Jun  8 16:40:21 PDT 2019
+/*ASR- TODO:
+	Check 0xF most significant nibble @
+	IMSI, MSISDN, MEI values updated into the ue_context from s11 create session request */
+
+/* ASR- TODO:
+	Check MME S11 IP address 10.10.1.10 not being int eh same subnet as the CPS11 IP 10.1.10.46 */
+
+/* ASR- TODO >> DONE:
+	Review/correct all rte_zmalloc_socket(NULL, sizeof(struct session_info)
+	Ensure uniqueness of session info in the CP heap
+	@~/cp:
+	grep -rn --include=*.{c,h} 'session = rte_zmalloc_socket' ./../
+	grep -rn --include=*.{c,h} 'si = rte_zmalloc_socket' ./../
+	*/
+
+Sun Jun  9 19:25:21 PDT 2019
+/* ASR- TODO >> DONE: Check: */
+@~/cp/gtpv2c_messages/delete_session.c::delete_cp_context::
+	/* Update ue_context hash reference @remaining context */
+	/* ASR- TODO >> DONE: Check:: ue_context hash will always have residue
+	 * ue_context hash will never be empty, even after all sessions deleted
+	 * */
+	*_context = context;
+
+/* ASR- TODO >> DONE: Check: */
+create_ue_context:: num_pdns = 0
+
+Tue Jun 11 08:51:04 PDT 2019
+/* ASR- TODO >> DONE: Correct:
+	Populate sctf servedPDPPDNAddress from pdn_connection.ipv4 */
+
+Thu Sep 12 11:29:00 PDT 2019
+/* ASR- TODO >> DONE: Remove extern from:: */
+ASR- NOTE: No action needed
+@~/dp/main.h::
+	extern struct rte_mempool *sgi_mempool;
+	extern struct rte_mempool *s1u_mempool;
+
+Thu Sep 12 22:56:18 PDT 2019
+/* ASR- TODO >> DONE: Pace #ifdef DDN at:: */
+~@/dp/dataplane.c::gtpu_encap()::
+	if (!si->dl_s1_info.enb_teid) {
+		...
+		#ifdef DDN SET_BIT(*pkts_queue_mask, i); #endif
+	}
+Thu May 16 16:26:35 PDT 2019:
+
+Sun Sep 15 16:26:09 PDT 2019
+/* ASR- TODO >> DONE: Place #ifdef DDN or Delete section:: */
+ASR- Note: Deleted
+@~/dp/sess_table.c::
+	dp_session_delete(struct dp_id dp_id, struct session_info *entry)
+	{
+		...
+		if (data->dl_ring != NULL) {
+			uint32_t worker_core_id;
+			uint32_t ue_ipv4_hash;
+			set_ue_ipv4_hash(&ue_ipv4_hash, &data->ue_addr.u.ipv4_addr);
+			set_worker_core_id(&worker_core_id, &ue_ipv4_hash);
+
+			struct rte_ring *ring = data->dl_ring;
+
+			data->dl_ring = NULL;
+			/* This is going to be nasty. We could potentially have a race
+			 * condition if modify bearer occurs directly before a delete
+			 * session, causing scan_notify_ring_func to work on the same
+			 * ring as this function. For our current tests, we *should* be
+			 * okay. For now.
+			 */
+			 ...
+			do {
+			...
+
+	/* ASR- TODO >> DONE: Place #ifdef DDN or Delete section:: */
+	1374  dp/sess_table.c <<dp_session_delete>>
+		set_worker_core_id(&worker_core_id, &ue_ipv4_hash);
+
+	1373  dp/sess_table.c <<dp_session_delete>>
+		set_ue_ipv4_hash(&ue_ipv4_hash, &data->ue_addr.u.ipv4_addr);
+
+	/* ASR- TODO >> DONE: Cleanup/Remove:: */
+	~/dp/pipeline/epc_packet_framework.h::
+		static inline void set_ue_ipv4_hash(uint32_t *hash, const uint32_t *ue_ip)
+		{
+			*hash = rte_hash_crc_4byte(*ue_ip, PRIME_VALUE);
+		}
+
+		static inline void
+		set_worker_core_id(uint32_t *worker_core_id, uint32_t *hash)
+		{
+			...
+		}
+
+/* ASR- TODO >> DONE: Review & Remove all compile options under:: */
+@~/dp/Makefile::
+	# ngic-dp inter-op/functional options CFLAGS
+	# #############################################################
+	# Un-comment below line to enable DDN(Downlink data notification)
+	#CFLAGS += -DDP_DDN
+
+	# Un-comment below line to enable Rating group CDRs.
+	# Disable/Comment out  RATING_GRP_CDR for performance profiling.
+	#CFLAGS += -DRATING_GRP_CDR
+
+	#un-comment below line to generate extended CDR file.
+	#Note: This will impact data traffic performance.
+	#CFLAGS += -DEXTENDED_CDR
+
+	# ASR- Un-comment below line to enable GTPU HEADER Sequence Number option.
+	#CFLAGS += -DGTPU_HDR_SEQNB
+
+	# Un-comment below line to enable hyperscan DPI.
+	# ASR- NGCORE_SHRINK for HYPERSCAN to be tested
+	#CFLAGS += -DHYPERSCAN_DPI
+
+	# Un-comment below line to enable PCC, ADC, CDR, FILTERING, METERING pipeline stages.
+	#CFLAGS += -DINCLUDE_MTR_STAGE
+
+Tue Sep 17 23:31:23 PDT 2019
+/* ASR- TODO >> DONE: Review/Update as needed:: */
+~/dp/pkt_engines/ngic_rtc_framework.c::
+	static int epc_lcore_main_loop(...) {
+		...
+		config = &epc_app.lcores[lcore];
+		...
+		}
+
+/* ASR- TODO >> DONE: Review function callback registration & replace w/
+	s1u_pktHandler, sgi_pkthandler func proto:: */
+ASR- NOTE:
+	callback registration requried for userplane_handler function re-direction based on
+	SGWU, PGWU, SPGWU configuration options
+@~/dp/pkt_engines/epc_ul.c::
+	register_ul_worker(ul_handler f, int port)
+@~/dp/pkt_engines/epc_dl.c::
+	register_ul_worker(dl_handler f, int port)
+
+/* ASR- TODO >> DONE: Replace struct port_pairs w/ port_pairs_t:: */
+@~/dp/pkt_engines::epc_arp.c, epc_ul.c, epc_dl.c, ngic_rtc_framework.h, ngic_rtc_framework.c
+
+/* ASR- REF: grep -rn tags for removal of pipeline */
+	NGIC_SHRINK
+	packet_framework >> ngic_rtc_framework
+	epc_packet_framework.h, epc_packet_framework.c >> ngic_rtc_framework.h, ngic_rtc_framework.h
+	pipeline
+
+Wed Sep 25 23:58:05 PDT 2019
+/* ASR- TODO >> DONE: Review code for re-entrancy of functions: */
+E.g.:
+@~dp/userplane_hanlder.c::
+	UL_CORE::s1u_pkt_handler(...)::update_nexthop_info(...)
+	DL_CORE::sgi_pkt_handler(...)::update_nexthop_info(...)
+
+Thu Sep 26 11:55:16 PDT 2019
+/* ASR- TODO >> DONE: Review separation of kni_mpool to:: */
+	kni_dlmp, kni_ulmp and effect in kni_handler.c::kni_alloc(...)
+
+Mon Sep 30 17:33:32 PDT 2019
+/* ASR- TODO >> DONE: Generalize S1U_PORT_ID & SGI_PORT_ID w/ enumerations */
+@~/dp/stats.c::dp_mbf_stats(...)
+
+/* ASR- TODO >> DONE: Review/Remove: */
+@~/dp/dataplane.c::
+	gtpu_decap(...) {
+			/* ASR-Probe:: Log(bad pkts[i]->data_len || pkt_len) */
+			epc_app.ul_params[S1U_PORT_ID].bad_pkt_idx = i;
+			...
+			...
+			/* ASR-Probe:: Log(bad pkts[i]->data_len || pkt_len) */
+			epc_app.ul_params[S1U_PORT_ID].bad_pkt_idx = i;
+			...
+	}
+@~/dp/stats.c:: FOR_REF
+@~/dp/pkt_engines/ngic_rtc_framework.h::
+	struct epc_ul/dl_params {
+		...
+		/** Current s1u_pkt_handler()::gtpu_decap::ref pkts[i]->data_len */
+		uint32_t ref_len;
+		/** Current s1u_pkt_handler()::gtpu_decap::bad pkt_idx = pkts[i] */
+		uint32_t bad_pkt_idx;
+		/** Current s1u_pkt_handler()::gtpu_decap::bad pkts[i]->data_len */
+		uint32_t bad_data_len;
+		/** Current s1u_pkt_handler()::gtpu_decap::bad pkts[i]->pkt_len */
+		uint32_t bad_pkt_len;
+	} __rte_cache_aligned;
+
+
+Wed Oct  2 13:00:51 PDT 2019
+/* ASR- TODO >> DONE: */
+mngt_egress, kni_egress mbuf acocunting- update design + code
+
+/* ASR- TODO >> DONE: */
+UL & DL q_unresolved_pkts() mbuf accounting- update design + code
+
+Fri Oct 25 10:41:23 PDT 2019
+/* ASR- TODO DONE: */
+	w/ STATIC_ARP: Remove all remannts of ARP_REQ, ARP_RSP
+	/* Update ARP_RSP alloc UL count */
+	epc_app.ul_params[pid].ul_mbuf_rtime.arp_rsp++;
+	/* Update ARP_REQ alloc UL count */
+	epc_app.ul_params[pid].ul_mbuf_rtime.arp_req++;
+
+Tue Oct 29 22:35:51 PDT 2019
+/* ASR- TODO >> DONE: Verify w/ Somnath: */
+@~/dp/pkt_engines/epc_dl.c::
+	Delete:
+	/* Process mngt_req pkts received on UL port */
+	pkt_rx = mngt_egress(&ip_op, pkt_rxburst);
+	pkt_tx = rte_eth_tx_burst(ip_op.out_pid, ip_op.out_qid, pkt_rxburst, pkt_rx);
+	/* Update TX+FREE DL mbuf count */
+	...
+	}
+
+/* ASR- TODO >> DONE: Request Somnath: */
+Place mixed packet burst processing w/ alloc | free of mbufs pptx
+@~/Syncplicity Folders/DTAG-TMO/
+
+/* ASR- TODO >> DONE: */
+To align w/ ul/dl_in_ah(...)::
+	case KNI_PKT:
+		...
+		kni_ingress(kni_port_params_array[pid], pid,
+				&pkts[i], 1);
+Change kni_ingress call to a single packet. Remove param: unsigned nb_rx
+	kni_ingress(struct kni_port_params *p, uint16_t port_id,
+			struct rte_mbuf *pkts_burst[PKT_BURST_SZ],
+			unsigned nb_rx)
+
+/* ASR- TODO >> DONE: Verify w/ Suresh: */
+@~/dp/mngtplane_handler.c::
+	Delete section below and all linked call tree
+	static const char *
+	arp_op_name(uint16_t arp_op)
+	{
+		switch (CHECK_ENDIAN_16(arp_op)) {
+		case (ARP_OP_REQUEST):
+			return "ARP Request";
+		...
+		}
+		...
+		return "Unkwown ARP op";
+	}
+
+/* ASR- TODO >> DONE: Verify s/ Suresh: */
+@~/dp/mngtplane_handler.c::int mngt_ingress(...)::
+	naming of:  char *mngt_reqoutin changed to: mngt_req
+
+Fri Jan 24 13:18:22 PST 2020
+/* ASR- TODO >> DONE: Remove/Clean */
+@/interface/udp/vepc_udp.o /* From git index as well */
+@/dp_ipc_api.* /* From git index as well */
+@/(cp | dp)/Makefile::
+	/test/simu_cp/simu_cp.o /* ONLY ON SIMU_CP */
+	@/test/simu_cp/nsb/nsb_test_util.o
+	Check (SDN_ODL_BUILD, ZMQ_COMM)
+@config/ng-core_cfg.mk::SDN_ODL_BUILD, ZMQ_COMM
+
+/* ASR- TODO: Validate together w/ TMOPL */
+@/home/ngic-rtcdavx/cp/gtpv2c_messages/create_session.c::
+	/* ASR- Proactively delete_session_resp on implicit delete */
+	set_gtpv2c_teid_header(gtpv2c_s11_tx, GTP_DELETE_SESSION_RSP,
+	    htonl(context->s11_mme_gtpc_teid), gtpv2c_rx->teid_u.has_teid.seq);
+	...
+	gtpv2c_send(s11_fd, (uint8_t*)gtpv2c_s11_tx,
+			payload_length,
+			(struct sockaddr *) &s11_mme_sockaddr,
+			sizeof(s11_mme_sockaddr));
+
+
+/* ASR- TODO >> DONE: BUILD Check */
+cp && dp w/ SDN_ODL_BUILD
+dp w/ DP_DDN
+
+/* ASR- TODO >> DONE: Check Issue */
+@cp/run.sh w/ SIMU_CP::
+	del_resp_op_id: rte_hash_lookup_data failed for op_id 0: No such file or directory (4294967294)
+
+/* ASR- TODO >> DONE: Check/Close */
+@/dp/Makefile::
+	# VS- Used CP counters for maintain simulator stats.
+	ifneq (,$(findstring SIMU_CP, $(CFLAGS)))
+	        SRCS-y += $(NG_CORE)/cp/cp_stats.o
+	endif
+
+/* ASR- TODO >> DONE: Check/Move */
+@/interface/interface.c::
+	/* VS: ROUTE DISCOVERY */
+	extern int netlink_sock;
+
+/* ASR- TODO: Check/Validate comment */
+@cp/main.c::
+			case GTP_RELEASE_ACCESS_BEARERS_REQ:
+				/* VCCCCB-47 ModifyBearerResp sent during ReleaseAccessBearers Procedure
+				 * Don't Send ReleaseAccessBearers response here, we should send the
+				 * response after we received modify bearer response from DP.
+				 */
+
+Mon Jan 27 10:18:20 PST 2020
+/* ASR- TODO >> DONE: Check stick slip CP CLI exit | cp_stats */
+- Bring in timer @~/cp/cp_stats.c
+
+Tue Jan 28 00:41:25 PST 2020
+/* ASR- TODO >> DONE: Restructure/Clean up SDN_ODL_BUILD defines */
+@/cp/main.c
+@/cp/stats_sync.c
+@/cp/cp_stats.c
+@/interface/interface.c
+@/interface/ipc/common_ipc_api.c
+
+Tue Jan 28 09:44:08 PST 2020
+/* ASR- TODO: Check & remove or re-instate:: */
+@/cp/main.c::
+	#ifdef CP_DP_TABLE_CONFIG
+		initialize_tables_on_dp();
+	#endif /* CP_DP_TABLE_CONFIG */
+
+Wed Jan 29 12:43:43 PST 2020
+Thu Jan 30 15:13:12 PST 2020
+Fri Jan 31 02:09:00 PST 2020
+/* ASR- TODO >> DONE: */
+- Rename:: ~/dp/stats.c, stats.h, commands.c
+- Rename::vepc_cp_dp_api.*
+
+/* ASR- TODO >> DONE: Check/Verify CP <ZMQ Push-pull> DP opid, especially DP response to session establishments/modificaiton/delete message w/ SIMU_CP|CP */
+
+/* ASR- TODO: Check w/ Suresh: Test vector used to validate */
+@~/cp/gtpv2c_messages/create_session.c::
+		/* SM- VCCCCB-28 Many PDN connections for same IMSI
+		 * Wait for the existing resources to be cleaned up (after DP sends
+		 * response). Otherwise exit after five retries.
+		 */
+		do {
+			usleep(1000);
+			retry++;
+			/* This operation is multi-thread safe with regards to other lookup threads */
+			ret = rte_hash_lookup(ue_context_by_imsi_hash, &imsi);
+			if((ret == -ENOENT) || retry >= 5) {
+				if (retry >= 5)
+					cause_res = GTPV2C_CAUSE_SYSTEM_FAILURE;
+				break;
+			}
+		} while(1);
+
+Wed Feb  5 01:11:56 PST 2020
+/* ASR- TODO >> DONE: CP CLI:: */
+	Monitor/account CUPS messages sent by CP and responded to by DP
+
+Fri Feb  7 01:04:02 PST 2020
+/* ASR- TODO >> DONE: CP | SIMU_CP:: */
+	Update ue_context_by_imsi_hash to reflect Session provisioned and reflect on
+	CP_CLI Interface Interaction stats
+
+/* ASR- TODO >> DONE: CP CLI:: */
+	Update columns for: S11::Delete Session Req/Rsp; CUPS::Delete Session Req/Rsp
+
+Fri Feb  7 14:40:49 PST 2020
+/* ASR- TODO >> DONE: Make functions local static:: */
+@~dp/dp_stats.c::
+		nic_in_stats();
+		ngic_rtc_in_stats();
+		ngic_rtc_out_stats();
+
+/* ASR- TODO >> DONE: Add CLI option to query specific IMSI */
+
+Sun Feb  9 17:06:34 PST 2020
+/* ASR- TODO >> DONE: Remove nsb_test_util files, direct[ory & reference from ~/dp/Makefile */
+
+/* ASR- TODO >> DONE: Make configurable: BASE_IMSI, BASE_S11_TEID, BASE_S1U_TEID */
+
+Mon Feb 10 09:56:08 PST 2020
+/* ASR- TODO >> DONE: Remove:: Decided w/ Suresh M not to remove. Cast as reserved for Future use */
+@~/cp/ue.c::
+	get_apn(char *apn_label, uint16_t apn_length)
+
+/* ASR- TODO >> DONE: Verify/Correct:: */
+ue_context.imsi, ue_context.msisdn are not populated... these values are invalid. They are not used hence there is no issue. But this needs to be corrected
+
+/* ASR- TODO >> DONE: Verify/Remove:: */
+@~/interface/ipc/common_ipc_api.h::
+	@ln# 83 struct resp_msgbuf r_buf; /* Required */
+	@ln# 110 struct msgbuf sbuf;      /* Removed */
+	@ln# 111 struct msgbuf rbuf;      /* Required */
+
+/* ASR- TODO >> DONE: Check discrepancy in:: */
+@~/cp/cp_stats.c::
+	ifistats.cups_csrsp = rsp_stats.cups_csrsp;
+	ifistats.cups_mbrsp = rsp_stats.cups_mbrsp;
+
+Tue Feb 11 14:01:38 PST 2020
+/* ASR- TODO >> DONE: CUPS Interface response hash/heap reconciliation stats */
+
+/* ASR- TODO >> DONE: Provision:: */
+@~/test/simu_cp/simu_cp::
+	generate_uecontext(int ue_idx, int max_ue_sess, int num_enb)::
+		ue_ip = htonl(((ue_context *)next_data)->dp_session->ue_addr.u.ipv4_addr);
+
+/* ASR- TODO >> DONE: Test:: */
+@~/cp/run.sh::option session_stats w/ simu_cp
+
+/* ASR- TODO: Close issue::  mme >> delete session on un-responsive cp:modify_bearer_request(...)
+Refer Tag: ASR- FOR_REF Note: Purge CP ue_context
+*/
+
+/* ASR- TODO >> DONE: Debug/Dig into following issue: */
+/* ASR- Refer SM Notes of Wed Feb 19 */
+When CP starts first and blocks on:
+		@~/cp_dp_api/cp_dp_api.c::return send_dp_msg(dp_id, &msg_payload);
+then:
+		@~/cp/cp_stats.c::val = cups_opid_rsp;
+	Falls short.
+	E.g. if #of sessions = 10000,
+		cups_opid_rsp should be= 20000 (10K csr + 10K mbr)
+		cups_opid_rsp actual value = 19242 (=758 short= [20000 - 19242])
+Most likely explanation:
+	When zmq send unblocks dp response counts are skipped in CP recv.
+	Note the opid are also not all fully retired.
+	@~/cp/cp_stats.c::
+			while (rte_hash_iterate(resp_op_id_hash, &next_key, &next_data, &iter) >= 0) {
+				i++;
+			}
+	Refer: @~/cp/logs/cp_ON-CP>ON-DP_2020-02-11.log
+Note: cp_stats::sesstats seg faults in this case after ~769 hash records
+Wed Feb 19 10:03:00 PST 2020
+/* SM- Notes */
+	Following scenarios are tried and its observation,
+	1. Run the test multilple times as suggested in the above procedure
+	   and observed the cups_opid_rsp count falling short
+
+	2. Added counter and printf in CSR/MBR in DP and the issue not observed
+@~/dp/sess_table.c::
+	dp_session_create(struct dp_id dp_id,
+			struct session_info *entry)
+	{
+		static int csr_cnt;
+		printf("CSR count:[%d]\n", ++csr_cnt);
+	}
+	dp_session_modify(struct dp_id dp_id,
+			struct session_info *entry)
+	{
+		static int mbr_cnt;
+		printf("MBR count:[%d]\n", ++mbr_cnt);
+	}
+
+	3. Commented out the response processing function process_dp_resp() in CP
+	   to check how many responses received at CP when the issue occurs. cups_resp
+	   count falling short in this function itself, which suggests ZMQ proxy itself not
+	   sending those messages to CP.
+@~/interface/ipc/common_ipc_api.c
+	int iface_remove_que(enum cp_dp_comm id)
+	{
+		static int cups_resp;
+		printf("Cups Response count:[%d]\n", ++cups_resp);
+
+		#ifndef SDN_ODL_BUILD
+		//process_dp_resp((void *)&r_buf);
+		#endif /* SDN_ODL_BUILD */
+	}
+
+Wed Feb 12 09:12:23 PST 2020
+/* ASR- TODO >> DONE: Review/Cleanup: */
+/* ASR- No cleanup required */
+@~/dp/sess_table.c::
+	dp_session_create(struct dp_id dp_id,
+			struct session_info *entry)
+	{
+		struct dp_session_info *data;
+		...
+		data = get_session_data(entry->sess_id, SESS_CREATE);
+		...
+	}
+	get_session_data(uint64_t sess_id, uint32_t is_mod)
+	{
+		struct dp_session_info *data = NULL;
+		...
+		rte_hash_lookup_data(rte_sess_hash, &sess_id, (void **)&data);
+		...
+		/* add entry*/
+		ret = rte_hash_add_key_data(rte_sess_hash, &sess_id, data);
+		...
+	}
+
+/* ASR- TODO >> DONE: Cleanup CLI format, IMSI, MSISDN values: */
+@~/cp/cp_stats.c::
+	disp_sesstats(void) {...}
+
+/* ASR- TODO: Check/Correct: */
+@~/cp/create_session.c::
+		memcpy(context->msisdn, csr->msisdn.msisdn, BINARY_MSISDN_LEN);
+Refer:
+@~/simu_cp/simu_cp.c::generate_uecontext(...) {
+	for (uint8_t i = 0; i < sizeof(uint64_t); i++) {
+		context->msisdn[i] = *((int8_t *)&msisdn + i);
+	}
+
+/* ASR- TODO: Correct: */
+@~/cp/cp_commands.c, ~/cp/cp_stats.c::
+	//					*((uint8_t *)(&imsi) + APN_IMSI_KEY_POSTN) =
+	//						*((uint8_t *)(&imsi) + APN_IMSI_KEY_POSTN) >>
+	//						APN_IMSI_KEY_LEN | APN_IMSI_SHIFT_VAL;
+
+Thu Feb 13 11:36:51 PST 2020
+/* ASR- TODO: epc_ul, epc_dl common function Complete */
+
+/* ASR- TODO: Eliminate mgmt core & target 2x CORE system- Complete */
+
+Tue Mar 17 19:11:36 PDT 2020
+/* ASR- TODO >> DONE: Align dp/Makefile, dp/dp_stats.c w/ ngic-rtclnx updates */
+
+Wed Mar 18 21:25:30 PDT 2020
+/* ASR- TODO >> DONE: Align w/ ngic-rtclnx updates */
+Remove #include util.h from::
+	~/cp/packet_filters.c
+	~/interface/interface.c
+	~/cp_dp_api/cp_dp_api.c
+Re-order:
+	~/cp/Makefile; ~/dp/Makefile
+
+Sun Mar 22 16:28:29 PDT 2020
+/* ASR- TODO: Correct issue w/ : */
+@~/cp/cp_stats.c:: OP_ID goes negative when::
+	1: cp starts > stops; dp starts:: processes msgs from zmq broker > stops
+	2: dp > starts:: no msgs from zmq broker
+	3: cp starts:: but now processes resp msgs from dp per #1:: cp_stats OPID goes negative
+
+Tue Mar 24 10:42:02 PDT 2020
+/* ASR- TODO: Build-in w/ CFLAG!=STATIC_ARP invocation of:: */
+~/kni_ifcfg::
+	kni-S1Udevcfg.sh, kni-SGIdevcfg.sh
+
+Mon Sep 16 09:37:48 PDT 2019
+/* ASR- Ref: inline tags for removal of pipeline */
+/* ASR- DRCT: Action required message */
+
+/* ASR- REF: set_apn(...) clean code example for integration */
+#include<stdio.h>
+	#include<string.h>
+
+	int main() {
+	   char *str = "xy1.ab2.apn3";
+	   printf("Actual APN name is %s\n", strrchr(str,'.') + 1);
+	   printf("length is %d\n", strlen(strrchr(str,'.')) - 1);
+	}
+
+Tue May 14 11:49:27 PDT 2019:
+/* ASR- gdb help */
+ p/x *((char *)pkts[0]->buf_addr + pkts[0]->data_off)@pkts[0]->data_len
+ p/x *((char *)m->buf_addr + m->data_off)@m->data_len
+
+/* ------------------------------------------------------------
+* SM- TODO List  Begin
+* ---------------------------------------------------------- */
+Mon Sep 23 15:33:13 PDT 2019
+/* SM- TODO: */
+	If ARP not resolved the packets are cloned and queued using quxmempool. Need to get rid of this logic
+
+Thu Sep 26 11:20:53 PDT 2019
+/* SM- TODO  >> DONE: */
+Use port_pairs_t structure to generalize where possible
+NOTE: epc_iface_core() and epc_util_handler() will not requires port_pairs_t structure.
+
+/* SM- TODO  >> DONE: */
+Generalize S1U_PORT_ID >> WEST_PORT_ID; SGI_PORT_ID >> EAST_PORT_ID across ngic_rtc_drct
+
+/* ASR- TODO >> DONE: */
+@~/config/ng-core_cfg.mk:: Remove NGCORE_SHRINK across ngic_rtcdrct
+
+Sat Sep 28 18:34:37 PDT 2019
+/* SM- TODO >> DONE: Review/Remove */
+@~/dp/pkt_engines/ngic_rtc_framework.c::
+	epc_init_rings(...)
+NOTE: epc_mct_spns_dns_rx ring will be removed as part of HYPERSCAN_DPI removal
+
+/* SM- TODO >> DONE: Review/Remove */
+Makefile option & usage of EXTENDED_CDR
+ASR- Note: Did you review EXTENDED_CDR is never used?
+
+/* SM- TODO >> DONE: Review/Remove */
+Check compilation and operation w/ each valid option of dp/Makefile
+
+Sun Sep 29 15:12:26 PDT 2019
+/* SM- TODO >> DONE: Review/Remove */
+@~/dp/pkt_engines/ngic_rtc_framework.c::
+	struct epc_app_params epc_app = {
+		...
+
+		/* Rings */
+		.ring_rx_size = EPC_DEFAULT_RING_SZ,
+		.ring_tx_size = EPC_DEFAULT_RING_SZ,
+		...
+		}
+
+/* SM- TODO >> DONE: Review/Remove::rte_pipeline_ah_packet_hijack... */
+@~/dp/userplane_handler.c::
+	LN: 582
+	#ifdef DP_DDN
+					rte_pipeline_ah_packet_hijack(p, pkts_queue_mask);
+					enqueue_dl_pkts(&sdf_info[0], pkts, pkts_queue_mask);
+	#endif	/* DP_DDN */
+
+/* SM- TODO >> DONE: TBD placed in userplane_handler.c
+ * If DP_DDN enabled, Handle enqueued packets appropriately.
+ * Make sure enqueued packets are not freed in epc_dl() */
+@~/dp/userplane_handler.c::
+	LN:583
+	#ifdef DP_DDN
+					enqueue_dl_pkts(&sdf_info[0], pkts, pkts_queue_mask);
+	#endif	/* DP_DDN */
+
+/* SM- TODO >> DONE: Review & ensure ngic_rtc cp + dp compile w/  DP_DDN option ... */
+@~/dp/main.h::
+	int notification_handler(struct rte_mbuf **pkts, uint32_t n,
+
+
+Mon Sep 30 15:18:37 PDT 2019
+/* SM- TODO >> DONE: For ARP_Response message, no need to allocate mbuf.*/
+@~/dp/mngtplane_handler.c::
+	uint16_t mngt_egress(port_pairs_t *ip_op, struct rte_mbuf **pkts)
+
+/* SM- TODO >> DONE: Remove STAT */
+Makefile option & usage of STAT
+
+Sat Oct 26 19:04:17 PDT 2019
+/* SM- TODO */
+if ~/dp/Makefile !STATIC_ARP then ~/dp/run.sh auto run:
+	~/ngic-rtcdavx/kni_ifcfg/kni-S1Udevcfg.sh
+	~/ngic-rtcdavx/kni_ifcfg/kni-SGIdevcfg.sh
+
+Sun Oct 27 18:04:24 PDT 2019
+/* SM- TODO >> DONE */
+Function description for:
+@~/dp/stats.c::
+	static void update_pktcnt_quo_rem(enum disp_params type)
+
+/* SM- TODO */
+In general ensure code line width is limited to 80 cols.
+

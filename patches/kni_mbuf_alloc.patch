@@ -1,0 +1,17 @@
+diff --git a/debug/rte_kni_dbg.c b/debug/rte_kni_dbg.c
+index 2867411..3f9edd3 100644
+--- a/debug/rte_kni_dbg.c
++++ b/debug/rte_kni_dbg.c
+@@ -633,7 +633,11 @@ rte_kni_rx_burst(struct rte_kni *kni, struct rte_mbuf **mbufs, unsigned num)
+ 	unsigned ret = kni_fifo_get(kni->tx_q, (void **)mbufs, num);
+ 
+ 	/* If buffers removed, allocate mbufs and then put them into alloc_q */
+-	if (ret)
++	/* SC- TMOPL VCCCCB-42: DP Freezes
++	 * Regardless of kni_fifo_get ret ::allocate mbufs & put into alloc_q
++	 * This will ensure mbufs are available for kni_egress
++	 * */
++	/* if (ret); Remove condition check */
+ 		kni_allocate_mbufs(kni);
+ 
+ 	return ret;
